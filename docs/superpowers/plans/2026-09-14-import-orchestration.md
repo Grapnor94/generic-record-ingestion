@@ -34,7 +34,8 @@
 
 **Modify:**
 - `src/db/imports.ts` — add narrow `failImportBatch(...)` helper.
-- `src/ingestion/prepare-record-staging.ts` — preserve source exception identity with a typed wrapper only if needed for safe callback classification.
+- `src/ingestion/prepare-record-staging.ts` — introduce a typed callback-failure wrapper that preserves original exception identity.
+- `tests/unit/prepare-record-staging.test.mjs` — typed callback failure coverage.
 - `tests/integration/import-queries.test.mjs` — transactional `failImportBatch(...)` coverage.
 - `tests/postgres/live-postgres.test.mjs` — live PostgreSQL orchestration gate.
 - `README.md` — document the supported V0.5 application-level API.
@@ -160,7 +161,7 @@ git commit -m "feat: add import failure terminalization"
 
 **Files:**
 - Modify: `src/ingestion/prepare-record-staging.ts`
-- Test: existing staging tests under `tests/unit/` and/or `tests/integration/stage-record-import.test.mjs`
+- Test: `tests/unit/prepare-record-staging.test.mjs`
 
 **Interfaces:**
 - Consumes: `transform`, `getRecordId`, and `diagnose` callbacks.
@@ -175,9 +176,9 @@ export class RecordStagingCallbackError extends Error {
 
 `UnsupportedRecordSchemaError` remains the header/schema discriminator.
 
-- [ ] **Step 1: Write a failing test for callback classification**
+- [ ] **Step 1: Write a failing callback-classification test**
 
-Test that a callback throwing `originalError` causes:
+In `tests/unit/prepare-record-staging.test.mjs`, add a test where `transform` throws `originalError` and assert:
 
 ```js
 assert.throws(
@@ -189,17 +190,25 @@ assert.throws(
 );
 ```
 
-Also retain the human-readable row-number message.
+Also assert the wrapper message still contains `Record staging failed at row 1:`. The same wrapper path covers exceptions from `transform`, `getRecordId`, and `diagnose` because all three execute inside the existing row-level `try` block.
 
 - [ ] **Step 2: Run the focused staging test and confirm RED**
 
-Expected: FAIL because the typed wrapper does not exist.
+```bash
+npm run build && node --test tests/unit/prepare-record-staging.test.mjs
+```
 
-- [ ] **Step 3: Implement the minimal typed wrapper**
+Expected: FAIL because `RecordStagingCallbackError` does not yet exist.
 
-Replace only the current generic callback rethrow with a dedicated class. Do not alter header validation, record-ID validation, row diagnostics, or preservation behavior.
+- [ ] **Step 3: Implement the typed wrapper**
 
-- [ ] **Step 4: Re-run focused staging tests**
+Add `RecordStagingCallbackError` in `src/ingestion/prepare-record-staging.ts` and replace only the current generic callback rethrow. Set `name = "RecordStagingCallbackError"`, preserve `rowNumber`, preserve the original value as `cause`, and keep the existing row-number message shape. Do not alter header validation, record-ID validation, row diagnostics, or preservation behavior.
+
+- [ ] **Step 4: Re-run the focused staging test**
+
+```bash
+npm run build && node --test tests/unit/prepare-record-staging.test.mjs
+```
 
 Expected: PASS.
 
@@ -214,7 +223,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/ingestion/prepare-record-staging.ts tests/unit tests/integration/stage-record-import.test.mjs
+git add src/ingestion/prepare-record-staging.ts tests/unit/prepare-record-staging.test.mjs
 git commit -m "refactor: classify staging callback failures"
 ```
 
@@ -267,7 +276,7 @@ export async function runRecordImport(
 
 - [ ] **Step 1: Write the happy-path failing test**
 
-Use CSV such as:
+Use CSV:
 
 ```text
 id,name
@@ -313,7 +322,14 @@ await createImportBatch(db, {
   schemaVersion: input.contract.schemaVersion,
 });
 const parsed = parseCsvRecords(input.csvText);
-const prepared = prepareRecordStaging({ ... });
+const prepared = prepareRecordStaging({
+  contract: input.contract,
+  headers: parsed.headers,
+  rows: parsed.rows,
+  transform: input.transform,
+  getRecordId: input.getRecordId,
+  diagnose: input.diagnose,
+});
 const persisted = await persistRecordStaging(db, {
   importId: input.importId,
   rows: prepared.rows,
@@ -321,7 +337,7 @@ const persisted = await persistRecordStaging(db, {
 const summary = await getImportSummary(db, input.importId);
 ```
 
-Throw an invariant error if `summary === null`.
+Throw `new Error(`Import summary missing after terminalization: ${input.importId}`)` if `summary === null`. Return `status: persisted.status` and the database summary.
 
 - [ ] **Step 4: Verify happy path GREEN**
 
@@ -349,9 +365,13 @@ await failImportBatch(db, {
 
 Catch `UnsupportedRecordSchemaError` around staging only and terminalize with `SCHEMA_HEADER_ERROR`. Do not catch `RecordStagingCallbackError` as an ordinary result.
 
-After any normal terminal path, call `getImportSummary` and return persisted state.
+After either pre-staging terminalization, call `getImportSummary`. If it is null, throw the same invariant error. Return `{ importId: input.importId, status: "FAILED", summary }`.
 
 - [ ] **Step 7: Run focused orchestration tests**
+
+```bash
+npm run build && node --test tests/integration/run-record-import.test.mjs
+```
 
 Expected: all ordinary success/failure cases PASS.
 
@@ -376,7 +396,7 @@ git commit -m "feat: add record import orchestration"
 
 - [ ] **Step 1: Write failing callback-exception tests**
 
-Use a callback that throws a stable object/error instance:
+Use a callback that throws a stable error instance:
 
 ```js
 const original = new Error("transform exploded");
@@ -390,14 +410,28 @@ Assert:
 
 - [ ] **Step 2: Run focused tests and confirm RED**
 
-Expected: FAIL until exceptional branch exists.
+```bash
+npm run build && node --test tests/integration/run-record-import.test.mjs
+```
+
+Expected: FAIL until exceptional callback handling exists.
 
 - [ ] **Step 3: Implement callback failure recovery**
 
 When catching `RecordStagingCallbackError`:
-1. attempt `failImportBatch(... STAGING_CALLBACK_ERROR ...)`;
-2. ignore any recovery error;
-3. throw `error.cause` unchanged.
+
+```ts
+try {
+  await failImportBatch(db, {
+    importId: input.importId,
+    issueCode: "STAGING_CALLBACK_ERROR",
+    detail: error.message,
+  });
+} catch {
+  // best effort only
+}
+throw error.cause;
+```
 
 Do not persist prepared rows.
 
@@ -411,15 +445,18 @@ Simulate `persistRecordStaging` failure after its transaction rolls back. Assert
 - orchestrator best-effort terminalizes `RECEIVED -> FAILED` with `IMPORT_PERSISTENCE_ERROR`;
 - orchestrator rethrows the exact original persistence error.
 
-Add a second case where `failImportBatch` recovery itself also fails. Assert the original persistence error still wins.
+Add a second case where failure terminalization also fails. Assert the original persistence error still wins.
 
 - [ ] **Step 6: Implement persistence-failure recovery**
 
-Wrap the persistence call so operational failures execute:
+Wrap only the persistence call:
 
 ```ts
 try {
-  await persistRecordStaging(...);
+  await persistRecordStaging(db, {
+    importId: input.importId,
+    rows: prepared.rows,
+  });
 } catch (error) {
   try {
     await failImportBatch(db, {
@@ -440,9 +477,13 @@ Do not use this branch for duplicate-ID creation failure, because no new batch e
 
 Assert:
 - duplicate import ID throws existing `Import batch already exists: <id>` behavior;
-- unexpected `null` summary throws an invariant error rather than fabricating a result.
+- unexpected `null` summary throws `Import summary missing after terminalization: <id>` rather than fabricating a result.
 
 - [ ] **Step 8: Run orchestration integration suite**
+
+```bash
+npm run build && node --test tests/integration/run-record-import.test.mjs
+```
 
 Expected: PASS.
 
@@ -468,18 +509,18 @@ git commit -m "feat: add import orchestration recovery semantics"
 
 Cover:
 1. successful orchestrated two-row import -> `VALIDATED`, two valid rows;
-2. malformed CSV or unsupported headers -> durable batch-level error with null row/record identifiers and `FAILED` status;
+2. malformed CSV -> durable `CSV_PARSE_ERROR` with null row/record identifiers and `FAILED` status;
 3. row-level validation error -> staged row marked `INVALID`, issue persisted, batch `FAILED`.
 
-Use unique import IDs per test and existing cleanup conventions in the file.
+Use unique import IDs per test and the existing cleanup conventions in `tests/postgres/live-postgres.test.mjs`.
 
-- [ ] **Step 2: Run local build/static test path if available**
+- [ ] **Step 2: Run dependency-complete in-memory verification**
 
 ```bash
 npm run verify
 ```
 
-Expected: PASS. If a local PostgreSQL service is unavailable, do not claim the live test passed locally.
+Expected: PASS. This step does not substitute for the PostgreSQL live gate.
 
 - [ ] **Step 3: Commit**
 
@@ -531,7 +572,7 @@ Expected:
 - all in-memory integration tests PASS;
 - PostgreSQL 18 live suite PASS.
 
-In the repository's authoritative environment, use the existing GitHub Actions workflow and record its run ID and exact commit SHA.
+If the local environment lacks PostgreSQL, run `npm ci && npm run verify` locally and use the existing GitHub Actions PostgreSQL 18 workflow as the authoritative live-database gate. Record its exact run ID and commit SHA.
 
 - [ ] **Step 3: Update `VERIFICATION.txt` only from fresh evidence**
 
@@ -553,13 +594,13 @@ git commit -m "docs: document import orchestration verification"
 
 - [ ] **Step 5: Perform final regression verification on the exact final feature head**
 
-Run the complete CI gate again after the documentation/evidence commit if that commit changes the feature-head SHA. The final evidence must correspond to the exact head proposed for pull request review.
+Run the complete CI gate again after the documentation/evidence commit because that commit changes the feature-head SHA. The final evidence must correspond to the exact head proposed for pull request review.
 
 ---
 
 ## Final Review Checklist
 
-Before opening/merging a pull request:
+Before opening or merging a pull request:
 
 - [ ] `runRecordImport(...)` is the only new high-level orchestration entry point.
 - [ ] Existing parser/staging/persistence/query APIs still work independently.
