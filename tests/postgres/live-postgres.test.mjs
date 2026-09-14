@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import pg from "pg";
 import { runMigrations } from "../../dist/db/migrations.js";
 import { persistRecordStaging } from "../../dist/ingestion/persist-record-staging.js";
+import { runRecordImport } from "../../dist/ingestion/run-record-import.js";
 import {
   createImportBatch,
   getImportBatch,
@@ -200,7 +201,6 @@ test("real PostgreSQL transaction rolls back partial writes on injected failure"
   });
 });
 
-
 test("live import lifecycle and query API works after clean bootstrap", async () => {
   await withDatabase(async (client) => {
     await runMigrations(client);
@@ -283,5 +283,113 @@ test("live import lifecycle and query API works after clean bootstrap", async ()
     assert.equal(await getImportSummary(client, "MISSING"), null);
     assert.deepEqual(await listImportRows(client, "MISSING"), []);
     assert.deepEqual(await listImportIssues(client, "MISSING"), []);
+  });
+});
+
+const orchestrationContract = {
+  schemaVersion: "live-orchestration-v1",
+  requiredHeaders: ["id", "name"],
+};
+
+const orchestrationTransform = (row) => ({ name: row.name.trim() });
+const orchestrationRecordId = (row) => row.id || null;
+
+test("live orchestration persists a successful two-row CSV import", async () => {
+  await withDatabase(async (client) => {
+    await runMigrations(client);
+
+    const result = await runRecordImport({
+      db: client,
+      importId: "LIVE-O-1",
+      contract: orchestrationContract,
+      csvText: "id,name\n1,Alice\n2,Bob\n",
+      transform: orchestrationTransform,
+      getRecordId: orchestrationRecordId,
+    });
+
+    assert.equal(result.status, "VALIDATED");
+    assert.deepEqual(result.summary, {
+      importId: "LIVE-O-1",
+      schemaVersion: "live-orchestration-v1",
+      status: "VALIDATED",
+      rowCount: 2,
+      validRowCount: 2,
+      invalidRowCount: 0,
+      pendingRowCount: 0,
+      errorCount: 0,
+      warningCount: 0,
+    });
+
+    const rows = await listImportRows(client, "LIVE-O-1");
+    assert.deepEqual(rows.map((row) => row.validationStatus), ["VALID", "VALID"]);
+    assert.deepEqual(rows[0].rawSourceRow, { id: "1", name: "Alice" });
+    assert.deepEqual(rows[0].sourceRow, { name: "Alice" });
+  });
+});
+
+test("live orchestration durably records a pre-staging CSV failure", async () => {
+  await withDatabase(async (client) => {
+    await runMigrations(client);
+
+    const result = await runRecordImport({
+      db: client,
+      importId: "LIVE-O-2",
+      contract: orchestrationContract,
+      csvText: 'id,name\n1,"Alice\n',
+      transform: orchestrationTransform,
+      getRecordId: orchestrationRecordId,
+    });
+
+    assert.equal(result.status, "FAILED");
+    assert.equal(result.summary.rowCount, 0);
+    assert.equal(result.summary.errorCount, 1);
+
+    const batch = await getImportBatch(client, "LIVE-O-2");
+    assert.equal(batch?.status, "FAILED");
+    assert.deepEqual(await listImportRows(client, "LIVE-O-2"), []);
+
+    const issues = await listImportIssues(client, "LIVE-O-2");
+    assert.equal(issues.length, 1);
+    assert.equal(issues[0].issueCode, "CSV_PARSE_ERROR");
+    assert.equal(issues[0].severity, "ERROR");
+    assert.equal(issues[0].rowNumber, null);
+    assert.equal(issues[0].recordId, null);
+  });
+});
+
+test("live orchestration persists row-level validation errors and fails the batch", async () => {
+  await withDatabase(async (client) => {
+    await runMigrations(client);
+
+    const result = await runRecordImport({
+      db: client,
+      importId: "LIVE-O-3",
+      contract: orchestrationContract,
+      csvText: "id,name\n1,Alice\n",
+      transform: orchestrationTransform,
+      getRecordId: orchestrationRecordId,
+      diagnose: () => [
+        {
+          code: "LIVE_INVALID_NAME",
+          severity: "ERROR",
+          fieldKey: "name",
+          detail: "Synthetic live blocking diagnostic.",
+        },
+      ],
+    });
+
+    assert.equal(result.status, "FAILED");
+    assert.equal(result.summary.invalidRowCount, 1);
+    assert.equal(result.summary.errorCount, 1);
+
+    const rows = await listImportRows(client, "LIVE-O-3");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].validationStatus, "INVALID");
+
+    const issues = await listImportIssues(client, "LIVE-O-3");
+    assert.equal(issues.length, 1);
+    assert.equal(issues[0].issueCode, "LIVE_INVALID_NAME");
+    assert.equal(issues[0].rowNumber, 1);
+    assert.equal((await getImportBatch(client, "LIVE-O-3"))?.status, "FAILED");
   });
 });
