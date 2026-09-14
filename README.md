@@ -11,7 +11,8 @@ It provides:
 - deterministic warning/error staging reports;
 - transactional persistence of canonical and raw JSON rows;
 - warning/error persistence where warnings remain non-blocking;
-- a single end-to-end staging entry point.
+- import lifecycle/query APIs;
+- a supported end-to-end CSV import orchestration API.
 
 ## Scope
 
@@ -28,6 +29,37 @@ npm run db:migrate
 ```
 
 Tests use Node's built-in test runner. Integration tests use a transactional in-memory `Queryable` harness to validate orchestration, SQL call sequencing, warning/error semantics, and rollback behavior.
+
+## End-to-end import orchestration
+
+V0.5 adds `runRecordImport(...)` in `src/ingestion/run-record-import.ts` as the supported application-level entry point for already-decoded CSV text:
+
+```ts
+const result = await runRecordImport({
+  db,
+  importId: "import-2026-09-14-001",
+  contract,
+  csvText,
+  transform,
+  getRecordId,
+  diagnose,
+});
+```
+
+The orchestrator composes the existing primitives rather than replacing them. Its normal flow is:
+
+1. create the `import_batch` in `RECEIVED` state;
+2. parse CSV text;
+3. validate headers and prepare canonical staging rows;
+4. persist stage rows and diagnostics transactionally;
+5. read the committed import summary;
+6. return `{ importId, status, summary }`.
+
+Ordinary input-quality failures are durable results rather than thrown exceptions. Malformed CSV is stored as a batch-level `CSV_PARSE_ERROR`; unsupported/missing schema headers are stored as `SCHEMA_HEADER_ERROR`; row-level diagnostics continue through the existing persistence path and can end the batch in `FAILED`. Batch-level issues use `row_number = NULL` and `record_id = NULL`.
+
+Caller callback failures from `transform`, `getRecordId`, or `diagnose` are treated as programming/application failures. The framework makes a best-effort attempt to record `STAGING_CALLBACK_ERROR`, persists no partial stage rows, and rethrows the original callback error. Persistence/database failures similarly receive best-effort `IMPORT_PERSISTENCE_ERROR` terminalization while preserving the original thrown database error. Duplicate import IDs keep the existing stable exception behavior.
+
+No new lifecycle status or issue table is introduced by V0.5. Pre-staging terminalization is deliberately narrow: only `RECEIVED -> FAILED` is supported outside the existing persistence transaction.
 
 ## CSV adapter
 
@@ -73,9 +105,10 @@ Committed migrations are immutable. Introduce schema changes with a new migratio
 
 ## Import lifecycle/query API
 
-The database service layer in `src/db/imports.ts` exposes five framework-neutral functions:
+The database service layer in `src/db/imports.ts` exposes framework-neutral lifecycle/query functions:
 
 - `createImportBatch` creates a new `RECEIVED` import batch;
+- `failImportBatch` transactionally records one batch-level error while allowing only `RECEIVED -> FAILED`;
 - `getImportBatch` reads batch metadata/status;
 - `listImportRows` returns staged rows in deterministic row-number order with an optional validation-status filter;
 - `listImportIssues` returns diagnostics in deterministic row/issue order with optional severity and row filters;
@@ -85,7 +118,7 @@ Lifecycle mutation remains deliberately narrow. `persistRecordStaging` owns the 
 
 ## Live PostgreSQL verification
 
-The live gate starts from an empty isolated PostgreSQL schema, applies the repository migrations with the same migration runner used by `npm run db:migrate`, and then exercises the actual persistence function. It checks:
+The live gate starts from an empty isolated PostgreSQL schema, applies the repository migrations with the same migration runner used by `npm run db:migrate`, and then exercises the real persistence and orchestration APIs. It checks:
 
 - clean-schema bootstrap creates all four package-owned tables;
 - migrations apply in lexical order and are recorded in `schema_migration`;
@@ -94,7 +127,10 @@ The live gate starts from an empty isolated PostgreSQL schema, applies the repos
 - canonical and raw JSON remain distinct;
 - warnings remain non-blocking and rows become `VALID`;
 - blocking errors make rows `INVALID` and the batch `FAILED`;
-- an injected database failure rolls back the batch status and all staged writes.
+- an injected database failure rolls back the batch status and all staged writes;
+- a successful two-row CSV import completes through `runRecordImport`;
+- a malformed CSV attempt is durably terminalized with a batch-level issue;
+- a row-level validation error persists an `INVALID` row and fails the batch.
 
 Run it where PostgreSQL is available:
 
