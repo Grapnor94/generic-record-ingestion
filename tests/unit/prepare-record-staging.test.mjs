@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { prepareRecordStaging } from "../../dist/ingestion/prepare-record-staging.js";
+import {
+  prepareRecordStaging,
+  RecordStagingCallbackError,
+} from "../../dist/ingestion/prepare-record-staging.js";
 
 const headers=["record_id","first_name","last_name","status","region","legacy_history_code"];
 const contract={schemaVersion:"GENERIC_V1",requiredHeaders:["record_id","first_name","last_name","status"],optionalHeaders:["region","legacy_history_code"]};
@@ -36,4 +39,12 @@ test("duplicate record IDs block and attach to later row",()=>{
 
 test("transform exception includes row number",()=>{
   assert.throws(()=>prepareRecordStaging({contract,headers,rows:[record()],transform:()=>{throw new Error("cannot normalize")},getRecordId}),/row 1: cannot normalize/i);
+});
+
+test("callback exception is typed and preserves the original error identity",()=>{
+  const originalError=new Error("cannot normalize");
+  assert.throws(
+    ()=>prepareRecordStaging({contract,headers,rows:[record()],transform:()=>{throw originalError},getRecordId}),
+    (error)=>error instanceof RecordStagingCallbackError && error.rowNumber===1 && error.cause===originalError && /row 1: cannot normalize/i.test(error.message),
+  );
 });
