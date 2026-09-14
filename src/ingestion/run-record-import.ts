@@ -1,6 +1,7 @@
 import { parseCsvRecords } from "../csv/parse-csv-records.js";
 import {
   createImportBatch,
+  failImportBatch,
   getImportSummary,
   type ImportSummary,
 } from "../db/imports.js";
@@ -13,6 +14,7 @@ import type {
   RecordSchemaContract,
   StagingDiagnostic,
 } from "./types.js";
+import { UnsupportedRecordSchemaError } from "./validate-headers.js";
 
 export type RunRecordImportInput = {
   db: Queryable;
@@ -36,6 +38,22 @@ export type RunRecordImportResult = {
   summary: ImportSummary;
 };
 
+function errorDetail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function resultFromCommittedSummary(
+  db: Queryable,
+  importId: string,
+  status: "VALIDATED" | "FAILED",
+): Promise<RunRecordImportResult> {
+  const summary = await getImportSummary(db, importId);
+  if (summary === null) {
+    throw new Error(`Import summary missing after terminalization: ${importId}`);
+  }
+  return { importId, status, summary };
+}
+
 export async function runRecordImport(
   input: RunRecordImportInput,
 ): Promise<RunRecordImportResult> {
@@ -44,29 +62,44 @@ export async function runRecordImport(
     schemaVersion: input.contract.schemaVersion,
   });
 
-  const parsed = parseCsvRecords(input.csvText);
-  const prepared = prepareRecordStaging({
-    contract: input.contract,
-    headers: parsed.headers,
-    rows: parsed.rows,
-    transform: input.transform,
-    getRecordId: input.getRecordId,
-    diagnose: input.diagnose,
-  });
+  let parsed: ReturnType<typeof parseCsvRecords>;
+  try {
+    parsed = parseCsvRecords(input.csvText);
+  } catch (error) {
+    await failImportBatch(input.db, {
+      importId: input.importId,
+      issueCode: "CSV_PARSE_ERROR",
+      detail: errorDetail(error),
+    });
+    return resultFromCommittedSummary(input.db, input.importId, "FAILED");
+  }
+
+  let prepared: ReturnType<typeof prepareRecordStaging>;
+  try {
+    prepared = prepareRecordStaging({
+      contract: input.contract,
+      headers: parsed.headers,
+      rows: parsed.rows,
+      transform: input.transform,
+      getRecordId: input.getRecordId,
+      diagnose: input.diagnose,
+    });
+  } catch (error) {
+    if (error instanceof UnsupportedRecordSchemaError) {
+      await failImportBatch(input.db, {
+        importId: input.importId,
+        issueCode: "SCHEMA_HEADER_ERROR",
+        detail: errorDetail(error),
+      });
+      return resultFromCommittedSummary(input.db, input.importId, "FAILED");
+    }
+    throw error;
+  }
 
   const persisted = await persistRecordStaging(input.db, {
     importId: input.importId,
     rows: prepared.rows,
   });
 
-  const summary = await getImportSummary(input.db, input.importId);
-  if (summary === null) {
-    throw new Error(`Import summary missing after terminalization: ${input.importId}`);
-  }
-
-  return {
-    importId: input.importId,
-    status: persisted.status,
-    summary,
-  };
+  return resultFromCommittedSummary(input.db, input.importId, persisted.status);
 }
