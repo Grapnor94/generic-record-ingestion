@@ -190,12 +190,12 @@ failImportBatch(db, {
 Required behavior:
 
 - operate transactionally;
-- accept only the intended transition from `RECEIVED` to `FAILED` for pre-staging failures, plus any explicitly required recovery transition identified during implementation;
+- permit only `RECEIVED -> FAILED`;
 - insert exactly one batch-level issue for the supplied failure;
 - avoid exposing a generic arbitrary status setter;
-- fail if the expected batch state is not present rather than silently mutating an unrelated lifecycle state.
+- fail if the batch is not currently `RECEIVED` rather than silently mutating another lifecycle state.
 
-If implementation requires separate helpers for normal pre-staging terminalization and best-effort recovery after a persistence transaction failure, they must remain narrow and lifecycle-specific rather than becoming a general status mutation API.
+This single transition is sufficient for both pre-staging failures and best-effort recovery after `persistRecordStaging` fails. Its existing transaction rolls back the earlier `RECEIVED -> VALIDATING` update together with all staging writes, so the durable batch returns to `RECEIVED` before recovery is attempted.
 
 ## Database and Infrastructure Failures
 
@@ -215,6 +215,8 @@ If the database is unavailable or the recovery write also fails, the orchestrato
 - do not substitute the recovery error for the original failure.
 
 This is explicitly best-effort recovery, not a guarantee under total database failure.
+
+A database failure during the initial `createImportBatch` call occurs before a durable batch exists. In that case the original database error is thrown and no recovery write is attempted.
 
 ## Duplicate Import IDs
 
@@ -284,9 +286,9 @@ Using the existing transactional in-memory `Queryable` harness, verify:
 - pre-staging failures produce no stage rows;
 - batch-level issues have null row/record identifiers;
 - row-level errors still flow through existing `persistRecordStaging` behavior;
-- failure-recording helper performs the correct lifecycle transition transactionally;
+- failure-recording helper performs `RECEIVED -> FAILED` transactionally;
 - callback exceptions do not persist partial rows;
-- persistence transaction failure triggers best-effort recovery and rethrows the original error;
+- persistence transaction failure rolls the durable batch back to `RECEIVED`, then triggers best-effort recovery and rethrows the original error;
 - recovery failure does not replace the original database error.
 
 ### Live PostgreSQL gate
