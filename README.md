@@ -3,6 +3,7 @@
 A standalone, domain-neutral TypeScript ingestion framework for structured record imports.
 
 It provides:
+- UTF-8 comma-separated CSV parsing with strict structural checks;
 - required/optional header validation with unknown-column rejection;
 - lossless raw-row copies kept separate from canonical transformer output;
 - caller-supplied record-ID extraction and diagnostics;
@@ -26,7 +27,30 @@ npm run verify
 npm run db:migrate
 ```
 
-The test suite is dependency-free and uses Node's built-in test runner. Integration tests use a transactional in-memory `Queryable` harness to validate orchestration, SQL call sequencing, warning/error semantics, and rollback behavior.
+Tests use Node's built-in test runner. Integration tests use a transactional in-memory `Queryable` harness to validate orchestration, SQL call sequencing, warning/error semantics, and rollback behavior.
+
+## CSV adapter
+
+`src/csv/parse-csv-records.ts` exposes a focused synchronous adapter for already-decoded UTF-8, comma-separated CSV text:
+
+```ts
+const parsed = parseCsvRecords(csvText);
+
+const prepared = prepareRecordStaging({
+  contract,
+  headers: parsed.headers,
+  rows: parsed.rows,
+  transform,
+  getRecordId,
+  diagnose,
+});
+```
+
+V0.4 supports standard quoted CSV fields, commas inside quoted fields, escaped double quotes, LF and CRLF line endings, empty fields, embedded quoted newlines, and an initial UTF-8 BOM. Decoded header and field strings are preserved without trimming or type coercion.
+
+The adapter owns CSV syntax and row-width validation only. The existing staging layer remains authoritative for schema-contract/header validation, canonical transformation, record-ID validation, and caller-supplied diagnostics. The CSV adapter does not perform lifecycle mutation or database persistence.
+
+V0.4 intentionally does not support TSV or pipe-delimited input, delimiter auto-detection, spreadsheet formats, non-UTF-8 transcoding, streaming, filesystem reads, or HTTP upload handling.
 
 ## Database bootstrap and migrations
 
