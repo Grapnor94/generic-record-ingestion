@@ -1,25 +1,21 @@
 Generic Record Ingestion verification record
-Date: 2026-09-13
+Date: 2026-09-14
 
-Verified in this workspace:
+Database bootstrap/migration verification
 - TypeScript typecheck: PASS
-- Unit tests: 12/12 PASS
-- In-memory integration tests: 6/6 PASS
-- Live PostgreSQL test file syntax: PASS (`node --check`)
-- Live PostgreSQL runner shell syntax: PASS (`bash -n`)
-- Scope scan across production source/tests: no political-domain mappings or individualized political attributes introduced
+- Unit migration discovery tests: 3/3 PASS
+- Full unit suite: 15/15 PASS
+- In-memory migration runner tests: 3/3 PASS
+- Full in-memory integration suite: 9/9 PASS
+- Existing unit/integration regression suite: PASS
+- Live PostgreSQL clean-schema bootstrap: PENDING GitHub Actions validation
+- Live PostgreSQL migration re-run/idempotency: PENDING GitHub Actions validation
+- Live PostgreSQL persistence after bootstrap: PENDING GitHub Actions validation
+- db/migrations/0001_add_raw_source_row.sql unchanged: PASS
 
-Live PostgreSQL gate status in this sandbox:
-- NOT EXECUTED because no `psql`/PostgreSQL server is installed.
-- Debian package metadata contains no PostgreSQL candidate.
-- Package-repository/network refresh timed out.
-- Direct binary retrieval is blocked by sandbox DNS/network restrictions.
-- The live runner fails explicitly with exit code 2 and message: `psql is required for the live PostgreSQL gate.`
+Local live PostgreSQL status
+- NOT EXECUTED because this sandbox has no `psql`/PostgreSQL server installed.
+- `npm run test:postgres` exited with code 2 and the expected prerequisite message: `psql is required for the live PostgreSQL gate.`
+- `tests/postgres/live-postgres.test.mjs` JavaScript syntax check: PASS (`node --check`).
 
-Portable live gate added:
-- `tests/postgres/live-postgres.test.mjs`
-- `scripts/run-postgres-integration.sh`
-- `.github/workflows/postgres-integration.yml`
-- `npm run test:postgres`
-
-The live test provisions a pre-migration schema, executes `0001_add_raw_source_row.sql`, then uses the actual `persistRecordStaging` function through a dedicated `pg` Client transaction. It verifies nullable JSONB migration semantics, lossless raw/canonical separation, warning behavior, blocking-error behavior, and rollback after an injected failure.
+The authoritative clean-schema PostgreSQL result must be recorded here only after the updated GitHub Actions workflow has completed successfully.

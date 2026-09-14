@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import pg from "pg";
+import { runMigrations } from "../../dist/db/migrations.js";
 import { persistRecordStaging } from "../../dist/ingestion/persist-record-staging.js";
 
 const { Client } = pg;
@@ -21,30 +21,6 @@ async function withDatabase(fn) {
   try {
     await client.query(`create schema "${schema}"`);
     await client.query(`set search_path to "${schema}", public`);
-    await client.query(`
-      create table import_batch (
-        import_id text primary key,
-        status text not null
-      );
-      create table import_stage_row (
-        import_id text not null,
-        row_number bigint not null,
-        record_id text,
-        source_row jsonb not null,
-        validation_status text not null,
-        primary key (import_id, row_number)
-      );
-      create table import_issue (
-        issue_id bigserial primary key,
-        import_id text not null,
-        row_number bigint,
-        record_id text,
-        issue_code text not null,
-        severity text not null check (severity in ('ERROR','WARNING')),
-        field_key text,
-        detail text not null
-      );
-    `);
     await fn(client, schema);
   } finally {
     await client.query("reset search_path").catch(() => {});
@@ -72,36 +48,60 @@ const warningRow = {
   ],
 };
 
-test("migration executes on PostgreSQL and adds nullable jsonb raw_source_row", async () => {
+test("migrations bootstrap an empty PostgreSQL schema and are idempotent", async () => {
   await withDatabase(async (client) => {
-    const migration = await readFile(
-      new URL("../../db/migrations/0001_add_raw_source_row.sql", import.meta.url),
-      "utf8",
-    );
-    await client.query(migration);
+    const first = await runMigrations(client);
+    assert.deepEqual(first, {
+      applied: ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql"],
+      skipped: [],
+    });
 
-    const result = await client.query(`
+    const tables = await client.query(`
+      select table_name
+      from information_schema.tables
+      where table_schema = current_schema()
+        and table_name in ('import_batch', 'import_stage_row', 'import_issue', 'schema_migration')
+      order by table_name
+    `);
+    assert.deepEqual(
+      tables.rows.map((row) => row.table_name),
+      ["import_batch", "import_issue", "import_stage_row", "schema_migration"],
+    );
+
+    const rawColumn = await client.query(`
       select data_type, is_nullable
       from information_schema.columns
       where table_schema = current_schema()
         and table_name = 'import_stage_row'
         and column_name = 'raw_source_row'
     `);
+    assert.equal(rawColumn.rowCount, 1);
+    assert.equal(rawColumn.rows[0].data_type, "jsonb");
+    assert.equal(rawColumn.rows[0].is_nullable, "YES");
 
-    assert.equal(result.rowCount, 1);
-    assert.equal(result.rows[0].data_type, "jsonb");
-    assert.equal(result.rows[0].is_nullable, "YES");
+    const ledger = await client.query(
+      "select filename from schema_migration order by filename",
+    );
+    assert.deepEqual(
+      ledger.rows.map((row) => row.filename),
+      ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql"],
+    );
+
+    const second = await runMigrations(client);
+    assert.deepEqual(second, {
+      applied: [],
+      skipped: ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql"],
+    });
   });
 });
 
 test("real persistence keeps raw/canonical JSON separate and warning nonblocking", async () => {
   await withDatabase(async (client) => {
-    const migration = await readFile(
-      new URL("../../db/migrations/0001_add_raw_source_row.sql", import.meta.url),
-      "utf8",
+    await runMigrations(client);
+    await client.query(
+      "insert into import_batch (import_id, schema_version, status) values ($1, $2, 'RECEIVED')",
+      ["LIVE-1", "test-v1"],
     );
-    await client.query(migration);
-    await client.query("insert into import_batch (import_id, status) values ($1, 'RECEIVED')", ["LIVE-1"]);
 
     const result = await persistRecordStaging(client, {
       importId: "LIVE-1",
@@ -131,12 +131,11 @@ test("real persistence keeps raw/canonical JSON separate and warning nonblocking
 
 test("real persistence marks blocking errors invalid and fails batch", async () => {
   await withDatabase(async (client) => {
-    const migration = await readFile(
-      new URL("../../db/migrations/0001_add_raw_source_row.sql", import.meta.url),
-      "utf8",
+    await runMigrations(client);
+    await client.query(
+      "insert into import_batch (import_id, schema_version, status) values ($1, $2, 'RECEIVED')",
+      ["LIVE-2", "test-v1"],
     );
-    await client.query(migration);
-    await client.query("insert into import_batch (import_id, status) values ($1, 'RECEIVED')", ["LIVE-2"]);
 
     const errorRow = {
       ...warningRow,
@@ -165,12 +164,11 @@ test("real persistence marks blocking errors invalid and fails batch", async () 
 
 test("real PostgreSQL transaction rolls back partial writes on injected failure", async () => {
   await withDatabase(async (client) => {
-    const migration = await readFile(
-      new URL("../../db/migrations/0001_add_raw_source_row.sql", import.meta.url),
-      "utf8",
+    await runMigrations(client);
+    await client.query(
+      "insert into import_batch (import_id, schema_version, status) values ($1, $2, 'RECEIVED')",
+      ["LIVE-3", "test-v1"],
     );
-    await client.query(migration);
-    await client.query("insert into import_batch (import_id, status) values ($1, 'RECEIVED')", ["LIVE-3"]);
 
     const failingDb = {
       async query(text, values) {

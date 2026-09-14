@@ -23,26 +23,37 @@ npm run typecheck
 npm test
 npm run test:integration
 npm run verify
+npm run db:migrate
 ```
 
 The test suite is dependency-free and uses Node's built-in test runner. Integration tests use a transactional in-memory `Queryable` harness to validate orchestration, SQL call sequencing, warning/error semantics, and rollback behavior.
 
-## PostgreSQL gate
+## Database bootstrap and migrations
 
-The included migration is PostgreSQL-compatible SQL:
+The package owns these PostgreSQL tables:
 
-```sql
-alter table import_stage_row
-  add column if not exists raw_source_row jsonb;
+- `import_batch`
+- `import_stage_row`
+- `import_issue`
+- `schema_migration`
+
+Apply all pending migrations with:
+
+```bash
+npm run db:migrate
 ```
 
-This execution environment did not provide PostgreSQL or Docker, so the migration and SQL statements have not been executed against a live PostgreSQL server here. Live PostgreSQL execution remains a deployment/integration gate.
+The command uses `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE`. Migration files live in `db/migrations`, are applied in lexical filename order, and are forward-only. Applied filenames are recorded in `schema_migration`; rerunning the command skips migrations already present in the ledger.
+
+Committed migrations are immutable. Introduce schema changes with a new migration file rather than editing an already-published migration.
 
 ## Live PostgreSQL verification
 
-A separate live gate now exercises the migration and the actual persistence function against PostgreSQL using a dedicated `pg` client connection. It checks:
+The live gate starts from an empty isolated PostgreSQL schema, applies the repository migrations with the same migration runner used by `npm run db:migrate`, and then exercises the actual persistence function. It checks:
 
-- migration execution from a pre-migration `import_stage_row` table;
+- clean-schema bootstrap creates all four package-owned tables;
+- migrations apply in lexical order and are recorded in `schema_migration`;
+- rerunning migrations is idempotent and skips applied filenames;
 - `raw_source_row` is nullable `jsonb`;
 - canonical and raw JSON remain distinct;
 - warnings remain non-blocking and rows become `VALID`;
@@ -52,7 +63,6 @@ A separate live gate now exercises the migration and the actual persistence func
 Run it where PostgreSQL is available:
 
 ```bash
-npm install --no-save pg@8
 PGHOST=127.0.0.1 \
 PGPORT=5432 \
 PGUSER=postgres \
@@ -61,4 +71,4 @@ PGDATABASE=postgres \
 npm run test:postgres
 ```
 
-The included `.github/workflows/postgres-integration.yml` provisions PostgreSQL 18 as a disposable service and runs both the dependency-free suite and this live gate.
+The included `.github/workflows/postgres-integration.yml` provisions PostgreSQL 18 as a disposable service and runs both the normal verification suite and this live gate.

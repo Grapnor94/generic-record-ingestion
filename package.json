@@ -10,6 +10,15 @@
     "test": "npm run build && node --test tests/unit/*.test.mjs",
     "test:integration": "npm run build && node --test tests/integration/*.test.mjs",
     "verify": "npm run typecheck && npm test && npm run test:integration",
-    "test:postgres": "bash ./scripts/run-postgres-integration.sh"
+    "test:postgres": "bash ./scripts/run-postgres-integration.sh",
+    "db:migrate": "npm run build && node dist/db/migrate.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.3",
+    "@types/pg": "^8.0.0"
+  },
+  "dependencies": {
+    "pg": "^8.0.0"
   }
 }
