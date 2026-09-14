@@ -28,8 +28,29 @@ CSV adapter V0.4 verification
 - Live PostgreSQL regression suite: 5/5 PASS
 - Runtime CSV dependency: csv-parse 7.0.2
 - Dependency graph: package-lock.json lockfileVersion 3 committed
-- Authoritative completed feature-head gate: PASS in GitHub Actions run 34862843133 on commit 6c824a3bd2fad70d50292a6636af1ddae1a7fc24
+- Authoritative completed feature-head gate: PASS in GitHub Actions run 34862843133 on commit 6c824a3bd01408a65404f036dcd34053a4514aad
 - That gate passed dependency installation, npm run verify, the live PostgreSQL gate, and cleanup.
+
+End-to-end import orchestration V0.5 verification
+- Approved architecture: thin runRecordImport(...) composition over existing CSV, staging, persistence, and query primitives
+- Every non-duplicate attempt creates its import batch before parsing
+- Batch-level failures reuse import_issue with null row_number and record_id
+- Narrow pre-staging lifecycle transition: RECEIVED -> FAILED only
+- CSV_PARSE_ERROR and SCHEMA_HEADER_ERROR return durable FAILED results
+- Row-level ERROR diagnostics persist through the existing transaction and return FAILED
+- Warning-only imports remain VALIDATED
+- Callback failures persist no partial rows, receive best-effort STAGING_CALLBACK_ERROR terminalization, and rethrow the original callback error
+- Persistence failures receive best-effort IMPORT_PERSISTENCE_ERROR terminalization and rethrow the original database error
+- Recovery failures do not replace the original operational error
+- Duplicate import IDs retain the existing stable exception behavior
+- Missing committed summaries are treated as invariant failures
+- TypeScript typecheck: PASS
+- Full unit suite: 25/25 PASS
+- Full in-memory integration suite: 33/33 PASS
+- Live PostgreSQL suite: 8/8 PASS
+- Live orchestration coverage includes successful two-row import, durable pre-staging CSV failure, and row-level blocking validation failure
+- Authoritative implementation/live-database gate: PASS in GitHub Actions run 34901618298 on commit 0d39955a4ce404ec531a9e80d7d22bc21eb8dd62
+- That gate passed dependency installation, npm run verify, PostgreSQL 18 orchestration coverage, and cleanup.
 
 Execution environment note
 - Local live PostgreSQL was not executed because the working sandbox does not provide the required repository/network/PostgreSQL environment.

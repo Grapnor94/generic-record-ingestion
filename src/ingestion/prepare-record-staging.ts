@@ -2,6 +2,19 @@ import type { PreparedRecord, RecordSchemaContract, StagingDiagnostic, StagingRe
 import { assertSupportedRecordHeaders } from "./validate-headers.js";
 import { validateRecordIds } from "./validate-record-ids.js";
 
+export class RecordStagingCallbackError extends Error {
+  readonly rowNumber: number;
+  readonly cause: unknown;
+
+  constructor(rowNumber: number, cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    super(`Record staging failed at row ${rowNumber}: ${message}`);
+    this.name = "RecordStagingCallbackError";
+    this.rowNumber = rowNumber;
+    this.cause = cause;
+  }
+}
+
 export function prepareRecordStaging(input: {
   contract: RecordSchemaContract;
   headers: readonly string[];
@@ -19,8 +32,7 @@ export function prepareRecordStaging(input: {
       const diagnostics=[...(input.diagnose?.(rawSourceRow,sourceRow)??[])];
       return {rowNumber:index+1,recordId,rawSourceRow,sourceRow,diagnostics};
     } catch(error) {
-      const message=error instanceof Error?error.message:String(error);
-      throw new Error(`Record staging failed at row ${index+1}: ${message}`);
+      throw new RecordStagingCallbackError(index+1,error);
     }
   });
   for (const item of validateRecordIds(rows.map(({rowNumber,recordId})=>({rowNumber,recordId})))) {

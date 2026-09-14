@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   createImportBatch,
+  failImportBatch,
   getImportBatch,
   listImportRows,
   listImportIssues,
@@ -132,4 +133,62 @@ test("getImportSummary maps independent aggregate counts including zeroes", asyn
 test("getImportSummary returns null when the batch does not exist", async () => {
   const db = new ScriptedDb([{ result: { rowCount: 0, rows: [] } }]);
   assert.equal(await getImportSummary(db, "MISSING"), null);
+});
+
+test("failImportBatch terminalizes RECEIVED batches and inserts one batch-level issue", async () => {
+  const db = new ScriptedDb([
+    { result: { rowCount: null, rows: [] } },
+    { result: { rowCount: 1, rows: [{ import_id: "IMP-1" }] } },
+    { result: { rowCount: 1, rows: [] } },
+    { result: { rowCount: null, rows: [] } },
+  ]);
+
+  await failImportBatch(db, {
+    importId: "IMP-1",
+    issueCode: "CSV_PARSE_ERROR",
+    detail: "bad csv",
+  });
+
+  assert.equal(db.calls.length, 4);
+  assert.match(db.calls[0].sql, /^begin$/i);
+  assert.match(db.calls[1].sql, /update import_batch/i);
+  assert.match(db.calls[1].sql, /status = 'RECEIVED'/i);
+  assert.deepEqual(db.calls[1].values, ["IMP-1"]);
+  assert.match(db.calls[2].sql, /insert into import_issue/i);
+  assert.deepEqual(db.calls[2].values, ["IMP-1", "CSV_PARSE_ERROR", "bad csv"]);
+  assert.match(db.calls[3].sql, /^commit$/i);
+});
+
+test("failImportBatch rejects non-RECEIVED batches and rolls back without inserting an issue", async () => {
+  const db = new ScriptedDb([
+    { result: { rowCount: null, rows: [] } },
+    { result: { rowCount: 0, rows: [] } },
+    { result: { rowCount: null, rows: [] } },
+  ]);
+
+  await assert.rejects(
+    () => failImportBatch(db, { importId: "IMP-1", issueCode: "CSV_PARSE_ERROR", detail: "bad csv" }),
+    { message: "Import must be in RECEIVED status before failure terminalization." },
+  );
+
+  assert.equal(db.calls.length, 3);
+  assert.match(db.calls[2].sql, /^rollback$/i);
+  assert.equal(db.calls.some((call) => /insert into import_issue/i.test(call.sql)), false);
+});
+
+test("failImportBatch rolls back when batch-level issue persistence fails", async () => {
+  const insertFailure = new Error("issue insert failed");
+  const db = new ScriptedDb([
+    { result: { rowCount: null, rows: [] } },
+    { result: { rowCount: 1, rows: [{ import_id: "IMP-1" }] } },
+    { error: insertFailure },
+    { result: { rowCount: null, rows: [] } },
+  ]);
+
+  await assert.rejects(
+    () => failImportBatch(db, { importId: "IMP-1", issueCode: "CSV_PARSE_ERROR", detail: "bad csv" }),
+    (error) => error === insertFailure,
+  );
+
+  assert.match(db.calls.at(-1).sql, /^rollback$/i);
 });
