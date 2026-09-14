@@ -5,7 +5,10 @@ import {
   getImportSummary,
   type ImportSummary,
 } from "../db/imports.js";
-import { prepareRecordStaging } from "./prepare-record-staging.js";
+import {
+  prepareRecordStaging,
+  RecordStagingCallbackError,
+} from "./prepare-record-staging.js";
 import {
   persistRecordStaging,
   type Queryable,
@@ -54,6 +57,19 @@ async function resultFromCommittedSummary(
   return { importId, status, summary };
 }
 
+async function bestEffortFail(
+  db: Queryable,
+  importId: string,
+  issueCode: string,
+  detail: string,
+): Promise<void> {
+  try {
+    await failImportBatch(db, { importId, issueCode, detail });
+  } catch {
+    // Audit recovery is best-effort; the original failure remains authoritative.
+  }
+}
+
 export async function runRecordImport(
   input: RunRecordImportInput,
 ): Promise<RunRecordImportResult> {
@@ -93,13 +109,33 @@ export async function runRecordImport(
       });
       return resultFromCommittedSummary(input.db, input.importId, "FAILED");
     }
+    if (error instanceof RecordStagingCallbackError) {
+      await bestEffortFail(
+        input.db,
+        input.importId,
+        "STAGING_CALLBACK_ERROR",
+        errorDetail(error),
+      );
+      throw error.cause;
+    }
     throw error;
   }
 
-  const persisted = await persistRecordStaging(input.db, {
-    importId: input.importId,
-    rows: prepared.rows,
-  });
+  let persisted: Awaited<ReturnType<typeof persistRecordStaging>>;
+  try {
+    persisted = await persistRecordStaging(input.db, {
+      importId: input.importId,
+      rows: prepared.rows,
+    });
+  } catch (error) {
+    await bestEffortFail(
+      input.db,
+      input.importId,
+      "IMPORT_PERSISTENCE_ERROR",
+      errorDetail(error),
+    );
+    throw error;
+  }
 
   return resultFromCommittedSummary(input.db, input.importId, persisted.status);
 }
