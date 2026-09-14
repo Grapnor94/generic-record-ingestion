@@ -58,6 +58,18 @@ class MemoryImportDb {
       return { rowCount: 1, rows: [row] };
     }
 
+    if (
+      q.startsWith("update import_batch") &&
+      q.includes("set status = 'failed'") &&
+      q.includes("status = 'received'")
+    ) {
+      const [importId] = values;
+      const batch = this.batches.get(importId);
+      if (!batch || batch.status !== "RECEIVED") return { rowCount: 0, rows: [] };
+      batch.status = "FAILED";
+      return { rowCount: 1, rows: [{ import_id: importId }] };
+    }
+
     if (q.startsWith("update import_batch") && q.includes("validating")) {
       const [importId] = values;
       const batch = this.batches.get(importId);
@@ -80,17 +92,31 @@ class MemoryImportDb {
     }
 
     if (q.startsWith("insert into import_issue")) {
-      const [importId, rowNumber, recordId, issueCode, severity, fieldKey, detail] = values;
-      this.issues.push({
-        issue_id: this.nextIssueId++,
-        import_id: importId,
-        row_number: rowNumber,
-        record_id: recordId,
-        issue_code: issueCode,
-        severity,
-        field_key: fieldKey,
-        detail,
-      });
+      if (values.length === 3) {
+        const [importId, issueCode, detail] = values;
+        this.issues.push({
+          issue_id: this.nextIssueId++,
+          import_id: importId,
+          row_number: null,
+          record_id: null,
+          issue_code: issueCode,
+          severity: "ERROR",
+          field_key: null,
+          detail,
+        });
+      } else {
+        const [importId, rowNumber, recordId, issueCode, severity, fieldKey, detail] = values;
+        this.issues.push({
+          issue_id: this.nextIssueId++,
+          import_id: importId,
+          row_number: rowNumber,
+          record_id: recordId,
+          issue_code: issueCode,
+          severity,
+          field_key: fieldKey,
+          detail,
+        });
+      }
       return { rowCount: 1, rows: [] };
     }
 
@@ -149,7 +175,6 @@ const getRecordId = (row) => row.id || null;
 
 test("runRecordImport persists a valid CSV import and returns the committed summary", async () => {
   const db = new MemoryImportDb();
-
   const result = await runRecordImport({
     db,
     importId: "import-ok",
@@ -177,4 +202,93 @@ test("runRecordImport persists a valid CSV import and returns the committed summ
   assert.equal(db.stage.length, 2);
   assert.deepEqual(db.stage[0].raw_source_row, { id: "1", name: "Alice" });
   assert.deepEqual(db.stage[0].source_row, { name: "Alice" });
+});
+
+test("malformed CSV becomes a durable batch-level CSV_PARSE_ERROR", async () => {
+  const db = new MemoryImportDb();
+  const result = await runRecordImport({
+    db,
+    importId: "import-csv-bad",
+    contract,
+    csvText: 'id,name\n1,"Alice\n',
+    transform,
+    getRecordId,
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assert.equal(result.summary.errorCount, 1);
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues.length, 1);
+  assert.equal(db.issues[0].issue_code, "CSV_PARSE_ERROR");
+  assert.equal(db.issues[0].row_number, null);
+  assert.equal(db.issues[0].record_id, null);
+});
+
+test("unsupported schema headers become SCHEMA_HEADER_ERROR without stage rows", async () => {
+  const db = new MemoryImportDb();
+  const result = await runRecordImport({
+    db,
+    importId: "import-schema-bad",
+    contract,
+    csvText: "id,unexpected\n1,Alice\n",
+    transform,
+    getRecordId,
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.errorCount, 1);
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues[0].issue_code, "SCHEMA_HEADER_ERROR");
+  assert.equal(db.issues[0].row_number, null);
+  assert.equal(db.issues[0].record_id, null);
+});
+
+test("row-level ERROR diagnostics persist and return FAILED without throwing", async () => {
+  const db = new MemoryImportDb();
+  const result = await runRecordImport({
+    db,
+    importId: "import-row-error",
+    contract,
+    csvText: "id,name\n1,Alice\n",
+    transform,
+    getRecordId,
+    diagnose: () => [{
+      code: "BAD_NAME",
+      severity: "ERROR",
+      fieldKey: "name",
+      detail: "Name rejected.",
+    }],
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.invalidRowCount, 1);
+  assert.equal(result.summary.errorCount, 1);
+  assert.equal(db.stage[0].validation_status, "INVALID");
+  assert.equal(db.issues[0].issue_code, "BAD_NAME");
+});
+
+test("warnings alone persist and return VALIDATED", async () => {
+  const db = new MemoryImportDb();
+  const result = await runRecordImport({
+    db,
+    importId: "import-warning",
+    contract,
+    csvText: "id,name\n1,Alice\n",
+    transform,
+    getRecordId,
+    diagnose: () => [{
+      code: "NAME_WARNING",
+      severity: "WARNING",
+      fieldKey: "name",
+      detail: "Name retained with warning.",
+    }],
+  });
+
+  assert.equal(result.status, "VALIDATED");
+  assert.equal(result.summary.validRowCount, 1);
+  assert.equal(result.summary.errorCount, 0);
+  assert.equal(result.summary.warningCount, 1);
+  assert.equal(db.stage[0].validation_status, "VALID");
 });
