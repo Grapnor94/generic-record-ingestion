@@ -9,6 +9,9 @@ class MemoryImportDb {
     this.issues = [];
     this.snapshot = null;
     this.nextIssueId = 1;
+    this.stageInsertError = null;
+    this.batchIssueError = null;
+    this.returnMissingSummary = false;
   }
 
   clone() {
@@ -79,6 +82,7 @@ class MemoryImportDb {
     }
 
     if (q.startsWith("insert into import_stage_row")) {
+      if (this.stageInsertError) throw this.stageInsertError;
       const [importId, rowNumber, recordId, sourceJson, rawJson] = values;
       this.stage.push({
         import_id: importId,
@@ -93,6 +97,7 @@ class MemoryImportDb {
 
     if (q.startsWith("insert into import_issue")) {
       if (values.length === 3) {
+        if (this.batchIssueError) throw this.batchIssueError;
         const [importId, issueCode, detail] = values;
         this.issues.push({
           issue_id: this.nextIssueId++,
@@ -140,6 +145,7 @@ class MemoryImportDb {
     }
 
     if (q.startsWith("select") && q.includes("from import_batch b") && q.includes("left join lateral")) {
+      if (this.returnMissingSummary) return { rowCount: 0, rows: [] };
       const [importId] = values;
       const batch = this.batches.get(importId);
       if (!batch) return { rowCount: 0, rows: [] };
@@ -173,15 +179,22 @@ const contract = {
 const transform = (row) => ({ name: row.name });
 const getRecordId = (row) => row.id || null;
 
+function baseInput(db, importId) {
+  return {
+    db,
+    importId,
+    contract,
+    csvText: "id,name\n1,Alice\n",
+    transform,
+    getRecordId,
+  };
+}
+
 test("runRecordImport persists a valid CSV import and returns the committed summary", async () => {
   const db = new MemoryImportDb();
   const result = await runRecordImport({
-    db,
-    importId: "import-ok",
-    contract,
+    ...baseInput(db, "import-ok"),
     csvText: "id,name\n1,Alice\n2,Bob\n",
-    transform,
-    getRecordId,
   });
 
   assert.deepEqual(result, {
@@ -207,12 +220,8 @@ test("runRecordImport persists a valid CSV import and returns the committed summ
 test("malformed CSV becomes a durable batch-level CSV_PARSE_ERROR", async () => {
   const db = new MemoryImportDb();
   const result = await runRecordImport({
-    db,
-    importId: "import-csv-bad",
-    contract,
+    ...baseInput(db, "import-csv-bad"),
     csvText: 'id,name\n1,"Alice\n',
-    transform,
-    getRecordId,
   });
 
   assert.equal(result.status, "FAILED");
@@ -229,12 +238,8 @@ test("malformed CSV becomes a durable batch-level CSV_PARSE_ERROR", async () => 
 test("unsupported schema headers become SCHEMA_HEADER_ERROR without stage rows", async () => {
   const db = new MemoryImportDb();
   const result = await runRecordImport({
-    db,
-    importId: "import-schema-bad",
-    contract,
+    ...baseInput(db, "import-schema-bad"),
     csvText: "id,unexpected\n1,Alice\n",
-    transform,
-    getRecordId,
   });
 
   assert.equal(result.status, "FAILED");
@@ -248,12 +253,7 @@ test("unsupported schema headers become SCHEMA_HEADER_ERROR without stage rows",
 test("row-level ERROR diagnostics persist and return FAILED without throwing", async () => {
   const db = new MemoryImportDb();
   const result = await runRecordImport({
-    db,
-    importId: "import-row-error",
-    contract,
-    csvText: "id,name\n1,Alice\n",
-    transform,
-    getRecordId,
+    ...baseInput(db, "import-row-error"),
     diagnose: () => [{
       code: "BAD_NAME",
       severity: "ERROR",
@@ -272,12 +272,7 @@ test("row-level ERROR diagnostics persist and return FAILED without throwing", a
 test("warnings alone persist and return VALIDATED", async () => {
   const db = new MemoryImportDb();
   const result = await runRecordImport({
-    db,
-    importId: "import-warning",
-    contract,
-    csvText: "id,name\n1,Alice\n",
-    transform,
-    getRecordId,
+    ...baseInput(db, "import-warning"),
     diagnose: () => [{
       code: "NAME_WARNING",
       severity: "WARNING",
@@ -291,4 +286,78 @@ test("warnings alone persist and return VALIDATED", async () => {
   assert.equal(result.summary.errorCount, 0);
   assert.equal(result.summary.warningCount, 1);
   assert.equal(db.stage[0].validation_status, "VALID");
+});
+
+test("callback exceptions are terminalized best-effort and rethrow the original error", async () => {
+  const db = new MemoryImportDb();
+  const original = new Error("transform exploded");
+
+  await assert.rejects(
+    () => runRecordImport({
+      ...baseInput(db, "import-callback"),
+      transform: () => { throw original; },
+    }),
+    (error) => error === original,
+  );
+
+  assert.equal(db.batches.get("import-callback").status, "FAILED");
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues.length, 1);
+  assert.equal(db.issues[0].issue_code, "STAGING_CALLBACK_ERROR");
+  assert.equal(db.issues[0].row_number, null);
+});
+
+test("persistence failures are terminalized best-effort and rethrow the original database error", async () => {
+  const db = new MemoryImportDb();
+  const original = new Error("stage insert failed");
+  db.stageInsertError = original;
+
+  await assert.rejects(
+    () => runRecordImport(baseInput(db, "import-persist-fail")),
+    (error) => error === original,
+  );
+
+  assert.equal(db.batches.get("import-persist-fail").status, "FAILED");
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues.length, 1);
+  assert.equal(db.issues[0].issue_code, "IMPORT_PERSISTENCE_ERROR");
+});
+
+test("recovery failure never replaces the original persistence error", async () => {
+  const db = new MemoryImportDb();
+  const original = new Error("stage insert failed");
+  db.stageInsertError = original;
+  db.batchIssueError = new Error("recovery issue insert failed");
+
+  await assert.rejects(
+    () => runRecordImport(baseInput(db, "import-recovery-fail")),
+    (error) => error === original,
+  );
+
+  assert.equal(db.batches.get("import-recovery-fail").status, "RECEIVED");
+  assert.equal(db.issues.length, 0);
+});
+
+test("duplicate import IDs preserve the existing duplicate exception", async () => {
+  const db = new MemoryImportDb();
+  db.batches.set("import-duplicate", {
+    import_id: "import-duplicate",
+    schema_version: "v1",
+    status: "RECEIVED",
+  });
+
+  await assert.rejects(
+    () => runRecordImport(baseInput(db, "import-duplicate")),
+    { message: "Import batch already exists: import-duplicate" },
+  );
+});
+
+test("missing committed summary is an operational invariant failure", async () => {
+  const db = new MemoryImportDb();
+  db.returnMissingSummary = true;
+
+  await assert.rejects(
+    () => runRecordImport(baseInput(db, "import-summary-missing")),
+    { message: "Import summary missing after terminalization: import-summary-missing" },
+  );
 });
