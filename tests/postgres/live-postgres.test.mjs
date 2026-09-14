@@ -3,6 +3,13 @@ import assert from "node:assert/strict";
 import pg from "pg";
 import { runMigrations } from "../../dist/db/migrations.js";
 import { persistRecordStaging } from "../../dist/ingestion/persist-record-staging.js";
+import {
+  createImportBatch,
+  getImportBatch,
+  listImportRows,
+  listImportIssues,
+  getImportSummary,
+} from "../../dist/db/imports.js";
 
 const { Client } = pg;
 
@@ -190,5 +197,91 @@ test("real PostgreSQL transaction rolls back partial writes on injected failure"
     assert.equal(staged.rows[0].count, 0);
     const issues = await client.query("select count(*)::int as count from import_issue where import_id = 'LIVE-3'");
     assert.equal(issues.rows[0].count, 0);
+  });
+});
+
+
+test("live import lifecycle and query API works after clean bootstrap", async () => {
+  await withDatabase(async (client) => {
+    await runMigrations(client);
+
+    const created = await createImportBatch(client, {
+      importId: "LIVE-Q-1",
+      schemaVersion: "test-v1",
+    });
+    assert.equal(created.status, "RECEIVED");
+    assert.equal(created.importId, "LIVE-Q-1");
+
+    const fetched = await getImportBatch(client, "LIVE-Q-1");
+    assert.equal(fetched?.schemaVersion, "test-v1");
+
+    await assert.rejects(
+      () => createImportBatch(client, { importId: "LIVE-Q-1", schemaVersion: "test-v1" }),
+      { message: "Import batch already exists: LIVE-Q-1" },
+    );
+
+    const rows = [
+      {
+        rowNumber: 1,
+        recordId: "R-1",
+        rawSourceRow: { record_id: "R-1", value: "ok" },
+        sourceRow: { value: "ok" },
+        diagnostics: [],
+      },
+      {
+        rowNumber: 2,
+        recordId: "R-2",
+        rawSourceRow: { record_id: "R-2", value: "warn" },
+        sourceRow: { value: "warn" },
+        diagnostics: [
+          { code: "WARN", severity: "WARNING", fieldKey: "value", detail: "Synthetic warning." },
+        ],
+      },
+      {
+        rowNumber: 3,
+        recordId: "R-3",
+        rawSourceRow: { record_id: "R-3", value: "bad" },
+        sourceRow: { value: "bad" },
+        diagnostics: [
+          { code: "BAD", severity: "ERROR", fieldKey: "value", detail: "Synthetic error." },
+        ],
+      },
+    ];
+
+    const persisted = await persistRecordStaging(client, { importId: "LIVE-Q-1", rows });
+    assert.deepEqual(persisted, { status: "FAILED", issueCount: 2 });
+
+    const allRows = await listImportRows(client, "LIVE-Q-1");
+    assert.deepEqual(allRows.map((row) => [row.rowNumber, row.validationStatus]), [
+      [1, "VALID"],
+      [2, "VALID"],
+      [3, "INVALID"],
+    ]);
+    assert.deepEqual((await listImportRows(client, "LIVE-Q-1", { status: "INVALID" })).map((row) => row.rowNumber), [3]);
+
+    const allIssues = await listImportIssues(client, "LIVE-Q-1");
+    assert.deepEqual(allIssues.map((issue) => [issue.rowNumber, issue.severity]), [
+      [2, "WARNING"],
+      [3, "ERROR"],
+    ]);
+    assert.deepEqual((await listImportIssues(client, "LIVE-Q-1", { severity: "ERROR" })).map((issue) => issue.rowNumber), [3]);
+    assert.deepEqual((await listImportIssues(client, "LIVE-Q-1", { rowNumber: 2 })).map((issue) => issue.severity), ["WARNING"]);
+
+    assert.deepEqual(await getImportSummary(client, "LIVE-Q-1"), {
+      importId: "LIVE-Q-1",
+      schemaVersion: "test-v1",
+      status: "FAILED",
+      rowCount: 3,
+      validRowCount: 2,
+      invalidRowCount: 1,
+      pendingRowCount: 0,
+      errorCount: 1,
+      warningCount: 1,
+    });
+
+    assert.equal(await getImportBatch(client, "MISSING"), null);
+    assert.equal(await getImportSummary(client, "MISSING"), null);
+    assert.deepEqual(await listImportRows(client, "MISSING"), []);
+    assert.deepEqual(await listImportIssues(client, "MISSING"), []);
   });
 });
