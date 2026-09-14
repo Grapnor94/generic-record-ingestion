@@ -158,6 +158,35 @@ export async function createImportBatch(
   }
 }
 
+export async function failImportBatch(
+  db: Queryable,
+  input: { importId: string; issueCode: string; detail: string },
+): Promise<void> {
+  await db.query("begin");
+  try {
+    const transition = await db.query(
+      `update import_batch
+       set status = 'FAILED'
+       where import_id = $1 and status = 'RECEIVED'
+       returning import_id`,
+      [input.importId],
+    );
+    if (transition.rowCount !== 1) {
+      throw new Error("Import must be in RECEIVED status before failure terminalization.");
+    }
+    await db.query(
+      `insert into import_issue
+         (import_id, row_number, record_id, issue_code, severity, field_key, detail)
+       values ($1, null, null, $2, 'ERROR', null, $3)`,
+      [input.importId, input.issueCode, input.detail],
+    );
+    await db.query("commit");
+  } catch (error) {
+    await db.query("rollback");
+    throw error;
+  }
+}
+
 export async function getImportBatch(db: Queryable, importId: string): Promise<ImportBatch | null> {
   const result = await db.query<BatchRow>(
     `select import_id, schema_version, status, created_at, updated_at
