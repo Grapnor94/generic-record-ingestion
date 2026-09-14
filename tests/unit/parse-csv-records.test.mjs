@@ -47,3 +47,31 @@ test("preserves embedded newlines inside quoted fields", () => {
     rows: [{ id: "1", note: "line one\nline two" }],
   });
 });
+
+test("rejects empty input without a header row", () => {
+  assert.throws(
+    () => parseCsvRecords(""),
+    /^Error: CSV parse failed: input does not contain a header row\.$/,
+  );
+});
+
+test("rejects short data rows with deterministic width detail", () => {
+  assert.throws(
+    () => parseCsvRecords("id,name\n1\n"),
+    /^Error: CSV parse failed: row 2 has 1 fields; expected 2\.$/,
+  );
+});
+
+test("rejects long data rows with deterministic width detail", () => {
+  assert.throws(
+    () => parseCsvRecords("id,name\n1,Alice,extra\n"),
+    /^Error: CSV parse failed: row 2 has 3 fields; expected 2\.$/,
+  );
+});
+
+test("translates unterminated quoted fields into a stable adapter error", () => {
+  assert.throws(
+    () => parseCsvRecords('id,note\n1,"unterminated'),
+    /^Error: CSV parse failed: .*unterminated quoted field.*$/i,
+  );
+});
