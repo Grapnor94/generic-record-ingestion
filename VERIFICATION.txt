@@ -3,22 +3,34 @@ Date: 2026-09-14
 
 Database bootstrap/migration verification
 - TypeScript typecheck: PASS
-- Full unit suite: 15/15 PASS
+- Full unit suite at bootstrap phase: 15/15 PASS
 - Migration discovery tests: 3/3 PASS
 - Migration runner integration tests: 3/3 PASS
 - PostgreSQL 18 clean-schema bootstrap: PASS in GitHub Actions run 34805208351 on feature commit 6a3ac77bd01408a65404f036dcd34053a4514aad
 - PostgreSQL 18 PR gate: PASS in GitHub Actions run 34806139533 before merge of PR #1
 - Bootstrap/migration feature merged to main as 963f042c08677df7c37380cdb8aaac3843485789
 
-Import lifecycle/query API local verification
+Import lifecycle/query API verification
 - TypeScript typecheck: PASS
-- Full unit suite: 15/15 PASS
+- Full unit suite at lifecycle phase: 15/15 PASS
 - Import lifecycle/query integration tests: 9/9 PASS
-- Full in-memory integration suite: 18/18 PASS
-- Live PostgreSQL test syntax check: PASS
-- Live PostgreSQL import lifecycle/query API: PENDING GitHub Actions validation
-- Existing migration/persistence regression suite: PASS
+- Full in-memory integration suite at lifecycle phase: 18/18 PASS
+- Live PostgreSQL import lifecycle/query API: PASS in GitHub Actions run 34807264239 on feature commit b6f13401a57ea7a1b82090203129f7e252c27a8d
+- Import lifecycle/query feature merged to main as 2a46848daee6a8bddb2fa0659d32818d5178c77b
 
-Local live PostgreSQL status
-- NOT EXECUTED because this sandbox has no PostgreSQL client/server available.
-- The authoritative import lifecycle/query PostgreSQL result must be recorded only after the implementation branch GitHub Actions workflow completes successfully.
+CSV adapter V0.4 verification
+- Approved scope: already-decoded UTF-8, comma-separated CSV only
+- TypeScript typecheck: PASS
+- Full unit suite: 24/24 PASS
+- CSV adapter unit coverage: ordinary rows, quoted commas, escaped quotes, LF/CRLF, BOM, empty fields, exact whitespace preservation, embedded quoted newlines, empty input, short rows, long rows, and unterminated quotes
+- Full in-memory integration suite: 20/20 PASS
+- CSV-to-staging composition tests: 2/2 PASS
+- Live PostgreSQL regression suite: 5/5 PASS
+- Runtime CSV dependency: csv-parse 7.0.2
+- Dependency graph: package-lock.json lockfileVersion 3 committed
+- Authoritative completed feature-head gate: PASS in GitHub Actions run 34862843133 on commit 6c824a3bd2fad70d50292a6636af1ddae1a7fc24
+- That gate passed dependency installation, npm run verify, the live PostgreSQL gate, and cleanup.
+
+Execution environment note
+- Local live PostgreSQL was not executed because the working sandbox does not provide the required repository/network/PostgreSQL environment.
+- GitHub Actions PostgreSQL 18 service runs are the authoritative live-database verification source.
