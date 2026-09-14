@@ -1,0 +1,15 @@
+{
+  "name": "generic-record-ingestion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "npm run build && node --test tests/unit/*.test.mjs",
+    "test:integration": "npm run build && node --test tests/integration/*.test.mjs",
+    "verify": "npm run typecheck && npm test && npm run test:integration",
+    "test:postgres": "./scripts/run-postgres-integration.sh"
+  }
+}
