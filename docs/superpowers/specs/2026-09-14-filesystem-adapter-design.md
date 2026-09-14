@@ -6,7 +6,7 @@ Approved in chat on 2026-09-14. This specification defines V0.6 of the domain-ne
 
 ## Goal
 
-Add a supported filesystem-based import entry point that reads a local CSV file as UTF-8 text and feeds it into the existing V0.5 CSV orchestration pipeline without changing the public behavior of `runRecordImport(...)`.
+Add a supported filesystem-based import entry point that reads a local CSV file under a strict UTF-8 contract and feeds it into the existing V0.5 CSV orchestration pipeline without changing the public behavior of `runRecordImport(...)`.
 
 V0.6 is intentionally narrow. It adds local file-path ingestion only. It does not add streaming, uploads, alternate encodings, delimiter detection, directory scanning, retries, publication, or domain-specific behavior.
 
@@ -71,7 +71,8 @@ runRecordImport(csvText)
 
 runRecordFileImport(filePath)
   -> create import batch
-  -> read file as UTF-8
+  -> read file bytes
+  -> strict UTF-8 decode
   -> shared post-batch CSV pipeline
 ```
 
@@ -89,27 +90,29 @@ This avoids duplicate lifecycle logic while ensuring each import batch is create
 
 Do not expose a public `skipBatchCreation` flag or similar lifecycle escape hatch. The shared helper is internal-only.
 
-## File Reading Semantics
+## File Reading and Decoding Semantics
 
-`runRecordFileImport(...)` accepts a filesystem path string and reads the entire file as UTF-8 text before parsing.
+`runRecordFileImport(...)` accepts a filesystem path string. It reads the entire file as bytes, then decodes those bytes using strict/fatal UTF-8 semantics before parsing.
 
-The file adapter owns only file access and decoding into text. It does not:
+Implementation must not rely on a permissive UTF-8 conversion that silently replaces malformed byte sequences. Malformed UTF-8 must be rejected and handled as `FILE_READ_ERROR`.
+
+The file adapter owns only file access and strict decoding into text. It does not:
 
 - detect delimiters
 - infer file formats
 - trim or normalize source values
 - interpret domain fields
 - stream records
-- accept `Buffer` or stream input
+- accept caller-supplied `Buffer` or stream input
 - support alternate encodings
 
-Once text is read successfully, all CSV parsing and import semantics are delegated to the existing V0.5 pipeline.
+Once text is decoded successfully, all CSV parsing and import semantics are delegated to the existing V0.5 pipeline.
 
 ## Durable Failure Semantics
 
 Every non-duplicate file import attempt must create a durable import batch before file reading begins.
 
-If the file cannot be read as the required UTF-8 input, terminalize the import as:
+If the file cannot be read or cannot be decoded under the strict UTF-8 contract, terminalize the import as:
 
 ```text
 status = FAILED
@@ -120,14 +123,14 @@ record_id = NULL
 field_key = NULL
 ```
 
-No staging rows are inserted for a file-read failure.
+No staging rows are inserted for a file-read or decode failure.
 
 Expected input/file-access failures return a normal `FAILED` import result rather than throwing. This includes errors such as:
 
 - path does not exist
 - permission denied
 - path cannot be opened as a readable file
-- file content cannot be decoded under the required UTF-8 contract
+- file bytes are not valid UTF-8
 
 The issue detail should retain the underlying error message through the framework's existing stable error-detail conversion.
 
@@ -175,7 +178,7 @@ Required coverage:
 1. valid UTF-8 CSV file -> `VALIDATED` and same persisted raw/canonical behavior as `runRecordImport(...)`
 2. missing file -> durable `FAILED` batch + one batch-level `FILE_READ_ERROR` + no staged rows
 3. unreadable file -> durable `FAILED` batch + `FILE_READ_ERROR` + no staged rows
-4. invalid UTF-8 under the required decoding contract -> durable `FAILED` batch + `FILE_READ_ERROR`
+4. malformed UTF-8 bytes -> durable `FAILED` batch + `FILE_READ_ERROR`
 5. readable malformed CSV -> existing `CSV_PARSE_ERROR`
 6. readable CSV with invalid headers -> existing `SCHEMA_HEADER_ERROR`
 7. readable CSV with row-level errors -> existing invalid-row + `FAILED` semantics
@@ -216,7 +219,7 @@ V0.6 is complete when:
 
 - callers can import a local CSV file through `runRecordFileImport(...)`
 - every non-duplicate attempt creates a durable batch before file reading
-- file-read failures are auditable as `FAILED` + `FILE_READ_ERROR`
+- file-access and strict UTF-8 failures are auditable as `FAILED` + `FILE_READ_ERROR`
 - all downstream CSV/staging/persistence behavior remains identical to V0.5
 - the existing `runRecordImport(...)` API remains unchanged
 - unit/integration tests and live PostgreSQL verification pass at the exact feature head
