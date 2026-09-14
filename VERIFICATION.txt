@@ -3,19 +3,22 @@ Date: 2026-09-14
 
 Database bootstrap/migration verification
 - TypeScript typecheck: PASS
-- Unit migration discovery tests: 3/3 PASS
 - Full unit suite: 15/15 PASS
-- In-memory migration runner tests: 3/3 PASS
-- Full in-memory integration suite: 9/9 PASS
-- Existing unit/integration regression suite: PASS
-- Live PostgreSQL clean-schema bootstrap: PENDING GitHub Actions validation
-- Live PostgreSQL migration re-run/idempotency: PENDING GitHub Actions validation
-- Live PostgreSQL persistence after bootstrap: PENDING GitHub Actions validation
-- db/migrations/0001_add_raw_source_row.sql unchanged: PASS
+- Migration discovery tests: 3/3 PASS
+- Migration runner integration tests: 3/3 PASS
+- PostgreSQL 18 clean-schema bootstrap: PASS in GitHub Actions run 34805208351 on feature commit 6a3ac77bd01408a65404f036dcd34053a4514aad
+- PostgreSQL 18 PR gate: PASS in GitHub Actions run 34806139533 before merge of PR #1
+- Bootstrap/migration feature merged to main as 963f042c08677df7c37380cdb8aaac3843485789
+
+Import lifecycle/query API local verification
+- TypeScript typecheck: PASS
+- Full unit suite: 15/15 PASS
+- Import lifecycle/query integration tests: 9/9 PASS
+- Full in-memory integration suite: 18/18 PASS
+- Live PostgreSQL test syntax check: PASS
+- Live PostgreSQL import lifecycle/query API: PENDING GitHub Actions validation
+- Existing migration/persistence regression suite: PASS
 
 Local live PostgreSQL status
-- NOT EXECUTED because this sandbox has no `psql`/PostgreSQL server installed.
-- `npm run test:postgres` exited with code 2 and the expected prerequisite message: `psql is required for the live PostgreSQL gate.`
-- `tests/postgres/live-postgres.test.mjs` JavaScript syntax check: PASS (`node --check`).
-
-The authoritative clean-schema PostgreSQL result must be recorded here only after the updated GitHub Actions workflow has completed successfully.
+- NOT EXECUTED because this sandbox has no PostgreSQL client/server available.
+- The authoritative import lifecycle/query PostgreSQL result must be recorded only after the implementation branch GitHub Actions workflow completes successfully.

@@ -47,6 +47,18 @@ The command uses `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE`. M
 
 Committed migrations are immutable. Introduce schema changes with a new migration file rather than editing an already-published migration.
 
+## Import lifecycle/query API
+
+The database service layer in `src/db/imports.ts` exposes five framework-neutral functions:
+
+- `createImportBatch` creates a new `RECEIVED` import batch;
+- `getImportBatch` reads batch metadata/status;
+- `listImportRows` returns staged rows in deterministic row-number order with an optional validation-status filter;
+- `listImportIssues` returns diagnostics in deterministic row/issue order with optional severity and row filters;
+- `getImportSummary` returns row-state and diagnostic counts without multiplying aggregates.
+
+Lifecycle mutation remains deliberately narrow. `persistRecordStaging` owns the validation transition `RECEIVED -> VALIDATING -> VALIDATED | FAILED`; there is no generic arbitrary status setter. Missing batch/summary lookups return `null`, while missing row/issue matches return empty arrays.
+
 ## Live PostgreSQL verification
 
 The live gate starts from an empty isolated PostgreSQL schema, applies the repository migrations with the same migration runner used by `npm run db:migrate`, and then exercises the actual persistence function. It checks:
