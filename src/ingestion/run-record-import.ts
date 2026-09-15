@@ -70,14 +70,9 @@ async function bestEffortFail(
   }
 }
 
-export async function runRecordImport(
+export async function runRecordImportAfterBatch(
   input: RunRecordImportInput,
 ): Promise<RunRecordImportResult> {
-  await createImportBatch(input.db, {
-    importId: input.importId,
-    schemaVersion: input.contract.schemaVersion,
-  });
-
   let parsed: ReturnType<typeof parseCsvRecords>;
   try {
     parsed = parseCsvRecords(input.csvText);
@@ -138,4 +133,15 @@ export async function runRecordImport(
   }
 
   return resultFromCommittedSummary(input.db, input.importId, persisted.status);
+}
+
+export async function runRecordImport(
+  input: RunRecordImportInput,
+): Promise<RunRecordImportResult> {
+  await createImportBatch(input.db, {
+    importId: input.importId,
+    schemaVersion: input.contract.schemaVersion,
+  });
+
+  return runRecordImportAfterBatch(input);
 }
