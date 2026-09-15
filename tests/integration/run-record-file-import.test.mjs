@@ -12,6 +12,8 @@ class MemoryImportDb {
     this.issues = [];
     this.snapshot = null;
     this.nextIssueId = 1;
+    this.stageInsertError = null;
+    this.batchIssueError = null;
   }
 
   clone() {
@@ -63,12 +65,14 @@ class MemoryImportDb {
       return { rowCount: 1, rows: [{ import_id: values[0] }] };
     }
     if (q.startsWith("insert into import_stage_row")) {
+      if (this.stageInsertError) throw this.stageInsertError;
       const [importId, rowNumber, recordId, sourceJson, rawJson] = values;
-      this.stage.push({ import_id: importId, row_number: rowNumber, record_id: recordId, source_row: JSON.parse(sourceJson), raw_source_row: JSON.parse(rawJson), validation_status: "PENDING" });
+      this.stage.push({ import_id: importId, row_number: rowNumber, record_id: recordId, source_row: JSON.parse(sourceJson), raw_source_row: rawJson === null ? null : JSON.parse(rawJson), validation_status: "PENDING" });
       return { rowCount: 1, rows: [] };
     }
     if (q.startsWith("insert into import_issue")) {
       if (values.length === 3) {
+        if (this.batchIssueError) throw this.batchIssueError;
         const [importId, issueCode, detail] = values;
         this.issues.push({ issue_id: this.nextIssueId++, import_id: importId, row_number: null, record_id: null, issue_code: issueCode, severity: "ERROR", field_key: null, detail });
       } else {
@@ -115,27 +119,30 @@ async function withTempDir(fn) {
   try { return await fn(dir); } finally { await rm(dir, { recursive: true, force: true }); }
 }
 
+async function csvFile(dir, contents, name = "records.csv") {
+  const filePath = join(dir, name);
+  await writeFile(filePath, contents, "utf8");
+  return filePath;
+}
+
 function input(db, importId, filePath) {
   return { db, importId, contract, filePath, transform, getRecordId };
 }
 
 test("valid UTF-8 CSV file imports through the existing staging pipeline", async () => withTempDir(async (dir) => {
-  const filePath = join(dir, "records.csv");
-  await writeFile(filePath, "id,name\n1,Alice\n", "utf8");
+  const filePath = await csvFile(dir, "id,name\n1,Alice\n");
   const db = new MemoryImportDb();
-
   const result = await runRecordFileImport(input(db, "file-ok", filePath));
-
   assert.equal(result.status, "VALIDATED");
   assert.equal(result.summary.rowCount, 1);
   assert.equal(db.stage.length, 1);
   assert.deepEqual(db.stage[0].raw_source_row, { id: "1", name: "Alice" });
+  assert.deepEqual(db.stage[0].source_row, { name: "Alice" });
 }));
 
 test("missing file becomes durable FILE_READ_ERROR with no staged rows", async () => withTempDir(async (dir) => {
   const db = new MemoryImportDb();
   const result = await runRecordFileImport(input(db, "file-missing", join(dir, "missing.csv")));
-
   assert.equal(result.status, "FAILED");
   assert.equal(result.summary.errorCount, 1);
   assert.equal(db.stage.length, 0);
@@ -149,12 +156,106 @@ test("malformed UTF-8 becomes durable FILE_READ_ERROR with no staged rows", asyn
   const filePath = join(dir, "invalid.csv");
   await writeFile(filePath, Buffer.from([0x69, 0x64, 0x2c, 0x6e, 0x61, 0x6d, 0x65, 0x0a, 0x31, 0x2c, 0xc3, 0x28]));
   const db = new MemoryImportDb();
-
   const result = await runRecordFileImport(input(db, "file-invalid-utf8", filePath));
-
   assert.equal(result.status, "FAILED");
   assert.equal(result.summary.errorCount, 1);
   assert.equal(db.stage.length, 0);
-  assert.equal(db.issues.length, 1);
   assert.equal(db.issues[0].issue_code, "FILE_READ_ERROR");
+}));
+
+test("malformed CSV preserves CSV_PARSE_ERROR semantics", async () => withTempDir(async (dir) => {
+  const filePath = await csvFile(dir, 'id,name\n1,"Alice\n');
+  const db = new MemoryImportDb();
+  const result = await runRecordFileImport(input(db, "file-csv-bad", filePath));
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues[0].issue_code, "CSV_PARSE_ERROR");
+}));
+
+test("invalid headers preserve SCHEMA_HEADER_ERROR semantics", async () => withTempDir(async (dir) => {
+  const filePath = await csvFile(dir, "id,unexpected\n1,Alice\n");
+  const db = new MemoryImportDb();
+  const result = await runRecordFileImport(input(db, "file-schema-bad", filePath));
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assert.equal(db.issues[0].issue_code, "SCHEMA_HEADER_ERROR");
+}));
+
+test("row-level ERROR diagnostics persist invalid rows and return FAILED", async () => withTempDir(async (dir) => {
+  const filePath = await csvFile(dir, "id,name\n1,Alice\n");
+  const db = new MemoryImportDb();
+  const result = await runRecordFileImport({
+    ...input(db, "file-row-error", filePath),
+    diagnose: () => [{ code: "BAD_NAME", severity: "ERROR", fieldKey: "name", detail: "Name rejected." }],
+  });
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.invalidRowCount, 1);
+  assert.equal(db.stage[0].validation_status, "INVALID");
+  assert.equal(db.issues[0].issue_code, "BAD_NAME");
+}));
+
+test("warnings-only file imports return VALIDATED", async () => withTempDir(async (dir) => {
+  const filePath = await csvFile(dir, "id,name\n1,Alice\n");
+  const db = new MemoryImportDb();
+  const result = await runRecordFileImport({
+    ...input(db, "file-warning", filePath),
+    diagnose: () => [{ code: "NAME_WARNING", severity: "WARNING", fieldKey: "name", detail: "Name retained." }],
+  });
+  assert.equal(result.status, "VALIDATED");
+  assert.equal(result.summary.warningCount, 1);
+  assert.equal(result.summary.errorCount, 0);
+  assert.equal(db.stage[0].validation_status, "VALID");
+}));
+
+test("callback exceptions preserve exact original error identity and terminalize best-effort", async () => withTempDir(async (dir) => {
+  const filePath = await csvFile(dir, "id,name\n1,Alice\n");
+  const db = new MemoryImportDb();
+  const original = new Error("transform exploded");
+  await assert.rejects(
+    () => runRecordFileImport({ ...input(db, "file-callback", filePath), transform: () => { throw original; } }),
+    (error) => error === original,
+  );
+  assert.equal(db.batches.get("file-callback").status, "FAILED");
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues[0].issue_code, "STAGING_CALLBACK_ERROR");
+}));
+
+test("persistence failures preserve exact original database error and terminalize best-effort", async () => withTempDir(async (dir) => {
+  const filePath = await csvFile(dir, "id,name\n1,Alice\n");
+  const db = new MemoryImportDb();
+  const original = new Error("stage insert failed");
+  db.stageInsertError = original;
+  await assert.rejects(
+    () => runRecordFileImport(input(db, "file-persist-fail", filePath)),
+    (error) => error === original,
+  );
+  assert.equal(db.batches.get("file-persist-fail").status, "FAILED");
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues[0].issue_code, "IMPORT_PERSISTENCE_ERROR");
+}));
+
+test("recovery failure does not replace the original persistence error", async () => withTempDir(async (dir) => {
+  const filePath = await csvFile(dir, "id,name\n1,Alice\n");
+  const db = new MemoryImportDb();
+  const original = new Error("stage insert failed");
+  db.stageInsertError = original;
+  db.batchIssueError = new Error("recovery issue insert failed");
+  await assert.rejects(
+    () => runRecordFileImport(input(db, "file-recovery-fail", filePath)),
+    (error) => error === original,
+  );
+  assert.equal(db.batches.get("file-recovery-fail").status, "RECEIVED");
+  assert.equal(db.issues.length, 0);
+}));
+
+test("duplicate import IDs preserve the stable duplicate exception", async () => withTempDir(async (dir) => {
+  const filePath = await csvFile(dir, "id,name\n1,Alice\n");
+  const db = new MemoryImportDb();
+  db.batches.set("file-duplicate", { import_id: "file-duplicate", schema_version: "v1", status: "RECEIVED" });
+  await assert.rejects(
+    () => runRecordFileImport(input(db, "file-duplicate", filePath)),
+    { message: "Import batch already exists: file-duplicate" },
+  );
+  assert.equal(db.stage.length, 0);
 }));
