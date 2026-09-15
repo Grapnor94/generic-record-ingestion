@@ -1,13 +1,13 @@
 Generic Record Ingestion verification record
-Date: 2026-09-14
+Date: 2026-09-14 / 2026-09-15
 
 Database bootstrap/migration verification
 - TypeScript typecheck: PASS
 - Full unit suite at bootstrap phase: 15/15 PASS
 - Migration discovery tests: 3/3 PASS
 - Migration runner integration tests: 3/3 PASS
-- PostgreSQL 18 clean-schema bootstrap: PASS in GitHub Actions run 34805208351 on feature commit 6a3ac77bd01408a65404f036dcd34053a4514aad
-- PostgreSQL 18 PR gate: PASS in GitHub Actions run 34806139533 before merge of PR #1
+- PostgreSQL 18 clean-schema bootstrap: PASS in GitHub Actions run 34805208351
+- PostgreSQL 18 PR gate: PASS in GitHub Actions run 34806139533
 - Bootstrap/migration feature merged to main as 963f042c08677df7c37380cdb8aaac3843485789
 
 Import lifecycle/query API verification
@@ -15,42 +15,44 @@ Import lifecycle/query API verification
 - Full unit suite at lifecycle phase: 15/15 PASS
 - Import lifecycle/query integration tests: 9/9 PASS
 - Full in-memory integration suite at lifecycle phase: 18/18 PASS
-- Live PostgreSQL import lifecycle/query API: PASS in GitHub Actions run 34807264239 on feature commit b6f13401a57ea7a1b82090203129f7e252c27a8d
-- Import lifecycle/query feature merged to main as 2a46848daee6a8bddb2fa0659d32818d5178c77b
+- Live PostgreSQL import lifecycle/query API: PASS in GitHub Actions run 34807264239
+- Feature merged to main as 2a46848daee6a8bddb2fa0659d32818d5178c77b
 
 CSV adapter V0.4 verification
-- Approved scope: already-decoded UTF-8, comma-separated CSV only
 - TypeScript typecheck: PASS
 - Full unit suite: 24/24 PASS
-- CSV adapter unit coverage: ordinary rows, quoted commas, escaped quotes, LF/CRLF, BOM, empty fields, exact whitespace preservation, embedded quoted newlines, empty input, short rows, long rows, and unterminated quotes
 - Full in-memory integration suite: 20/20 PASS
 - CSV-to-staging composition tests: 2/2 PASS
-- Live PostgreSQL regression suite: 5/5 PASS
-- Runtime CSV dependency: csv-parse 7.0.2
-- Dependency graph: package-lock.json lockfileVersion 3 committed
-- Authoritative completed feature-head gate: PASS in GitHub Actions run 34862843133 on commit 6c824a3bd01408a65404f036dcd34053a4514aad
-- That gate passed dependency installation, npm run verify, the live PostgreSQL gate, and cleanup.
+- Runtime dependency: csv-parse 7.0.2
+- Completed feature and PR gates passed before merge; post-merge main gate passed.
 
 End-to-end import orchestration V0.5 verification
-- Approved architecture: thin runRecordImport(...) composition over existing CSV, staging, persistence, and query primitives
-- Every non-duplicate attempt creates its import batch before parsing
-- Batch-level failures reuse import_issue with null row_number and record_id
-- Narrow pre-staging lifecycle transition: RECEIVED -> FAILED only
-- CSV_PARSE_ERROR and SCHEMA_HEADER_ERROR return durable FAILED results
-- Row-level ERROR diagnostics persist through the existing transaction and return FAILED
-- Warning-only imports remain VALIDATED
-- Callback failures persist no partial rows, receive best-effort STAGING_CALLBACK_ERROR terminalization, and rethrow the original callback error
-- Persistence failures receive best-effort IMPORT_PERSISTENCE_ERROR terminalization and rethrow the original database error
-- Recovery failures do not replace the original operational error
-- Duplicate import IDs retain the existing stable exception behavior
-- Missing committed summaries are treated as invariant failures
-- TypeScript typecheck: PASS
+- Thin runRecordImport(...) composition over existing CSV, staging, persistence, and query primitives
+- Durable batch creation before parsing; batch-level failures use import_issue
+- CSV_PARSE_ERROR / SCHEMA_HEADER_ERROR return FAILED; row ERROR returns FAILED; warnings remain VALIDATED
+- Callback/persistence failures preserve original thrown error after best-effort terminalization
 - Full unit suite: 25/25 PASS
 - Full in-memory integration suite: 33/33 PASS
 - Live PostgreSQL suite: 8/8 PASS
-- Live orchestration coverage includes successful two-row import, durable pre-staging CSV failure, and row-level blocking validation failure
-- Authoritative implementation/live-database gate: PASS in GitHub Actions run 34901618298 on commit 0d39955a4ce404ec531a9e80d7d22bc21eb8dd62
-- That gate passed dependency installation, npm run verify, PostgreSQL 18 orchestration coverage, and cleanup.
+- V0.5 merged to main as c2feeb4604f24e08b7f8fff7ee987899d0d4c962; post-merge run 34905766949 passed.
+
+Filesystem adapter V0.6 verification
+- Branch: feature/filesystem-adapter
+- Architecture: runRecordFileImport(...) creates the batch before filesystem access and delegates successfully decoded text to the shared post-batch CSV pipeline
+- Existing runRecordImport(...) remains source-compatible and still creates exactly one durable batch
+- Whole-file local filesystem reads only
+- Strict fatal UTF-8 decoding; malformed bytes are not replacement-decoded
+- Missing/unreadable files and malformed UTF-8 return durable FAILED results with FILE_READ_ERROR and no staged rows
+- Successful reads retain existing CSV_PARSE_ERROR, SCHEMA_HEADER_ERROR, row diagnostic, warning, callback, persistence, duplicate-ID, and summary-invariant semantics
+- Task 1 refactor verification: GitHub Actions run 34916894213
+- Filesystem adapter RED checkpoint: run 34919408853 failed because the new module did not yet exist
+- Filesystem adapter GREEN checkpoint: run 34919480397 passed
+- Semantic-parity gate: run 34921418896 passed
+- Pre-documentation implementation/live-database gate: PASS in GitHub Actions run 34921605502 on commit b9aa99ebf324a267fcba599eeb481976672cc670
+- npm run verify in run 34921605502: TypeScript PASS; unit 25/25 PASS; in-memory integration 45/45 PASS
+- npm run test:postgres in run 34921605502: 11/11 PASS
+- Live filesystem PostgreSQL coverage: successful CSV file, durable missing-file FILE_READ_ERROR, and downstream row-level blocking diagnostic
+- Final exact-head documentation gate: PENDING after this verification-record commit; V0.6 must not be declared complete until that run passes.
 
 Execution environment note
 - Local live PostgreSQL was not executed because the working sandbox does not provide the required repository/network/PostgreSQL environment.
