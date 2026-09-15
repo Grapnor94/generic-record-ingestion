@@ -12,6 +12,7 @@ class MemoryImportDb {
     this.stageInsertError = null;
     this.batchIssueError = null;
     this.returnMissingSummary = false;
+    this.batchInsertCount = 0;
   }
 
   clone() {
@@ -46,6 +47,7 @@ class MemoryImportDb {
     }
 
     if (q.startsWith("insert into import_batch")) {
+      this.batchInsertCount += 1;
       const [importId, schemaVersion] = values;
       if (this.batches.has(importId)) {
         throw Object.assign(new Error("duplicate"), { code: "23505" });
@@ -215,6 +217,15 @@ test("runRecordImport persists a valid CSV import and returns the committed summ
   assert.equal(db.stage.length, 2);
   assert.deepEqual(db.stage[0].raw_source_row, { id: "1", name: "Alice" });
   assert.deepEqual(db.stage[0].source_row, { name: "Alice" });
+});
+
+test("text imports still create exactly one durable batch", async () => {
+  const db = new MemoryImportDb();
+  const result = await runRecordImport(baseInput(db, "text-regression"));
+
+  assert.equal(result.status, "VALIDATED");
+  assert.equal(db.batchInsertCount, 1);
+  assert.equal(result.summary.rowCount, 1);
 });
 
 test("malformed CSV becomes a durable batch-level CSV_PARSE_ERROR", async () => {
