@@ -30,13 +30,13 @@ async function withTempDir(fn) { const dir = await mkdtemp(join(tmpdir(), "recor
 const warningRow = { rowNumber: 1, recordId: "R-1", rawSourceRow: { record_id: " R-1 ", first_name: " Ada ", legacy_history_code: " RAW-7 " }, sourceRow: { first_name: "Ada" }, diagnostics: [{ code: "LEGACY_VALUE", severity: "WARNING", fieldKey: "legacy_history_code", detail: "Legacy value retained in raw source." }] };
 
 test("migrations bootstrap an empty PostgreSQL schema and are idempotent", async () => { await withDatabase(async (client) => {
-  const first = await runMigrations(client); assert.deepEqual(first, { applied: ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql"], skipped: [] });
+  const first = await runMigrations(client); assert.deepEqual(first, { applied: ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql", "0002_add_import_provenance.sql"], skipped: [] });
   const tables = await client.query(`select table_name from information_schema.tables where table_schema = current_schema() and table_name in ('import_batch','import_stage_row','import_issue','schema_migration') order by table_name`);
   assert.deepEqual(tables.rows.map((r) => r.table_name), ["import_batch","import_issue","import_stage_row","schema_migration"]);
   const rawColumn = await client.query(`select data_type,is_nullable from information_schema.columns where table_schema=current_schema() and table_name='import_stage_row' and column_name='raw_source_row'`);
   assert.equal(rawColumn.rowCount,1); assert.equal(rawColumn.rows[0].data_type,"jsonb"); assert.equal(rawColumn.rows[0].is_nullable,"YES");
-  const ledger = await client.query("select filename from schema_migration order by filename"); assert.deepEqual(ledger.rows.map((r)=>r.filename),["0000_create_core_tables.sql","0001_add_raw_source_row.sql"]);
-  const second = await runMigrations(client); assert.deepEqual(second,{applied:[],skipped:["0000_create_core_tables.sql","0001_add_raw_source_row.sql"]});
+  const ledger = await client.query("select filename from schema_migration order by filename"); assert.deepEqual(ledger.rows.map((r)=>r.filename),["0000_create_core_tables.sql","0001_add_raw_source_row.sql", "0002_add_import_provenance.sql"]);
+  const second = await runMigrations(client); assert.deepEqual(second,{applied:[],skipped:["0000_create_core_tables.sql","0001_add_raw_source_row.sql", "0002_add_import_provenance.sql"]});
 }); });
 
 test("real persistence keeps raw/canonical JSON separate and warning nonblocking", async () => { await withDatabase(async (client) => {
@@ -68,7 +68,7 @@ test("live import lifecycle and query API works after clean bootstrap", async ()
   const rows=[{rowNumber:1,recordId:"R-1",rawSourceRow:{record_id:"R-1",value:"ok"},sourceRow:{value:"ok"},diagnostics:[]},{rowNumber:2,recordId:"R-2",rawSourceRow:{record_id:"R-2",value:"warn"},sourceRow:{value:"warn"},diagnostics:[{code:"WARN",severity:"WARNING",fieldKey:"value",detail:"Synthetic warning."}]},{rowNumber:3,recordId:"R-3",rawSourceRow:{record_id:"R-3",value:"bad"},sourceRow:{value:"bad"},diagnostics:[{code:"BAD",severity:"ERROR",fieldKey:"value",detail:"Synthetic error."}]}];
   assert.deepEqual(await persistRecordStaging(client,{importId:"LIVE-Q-1",rows}),{status:"FAILED",issueCount:2});
   assert.deepEqual((await listImportRows(client,"LIVE-Q-1")).map((r)=>[r.rowNumber,r.validationStatus]),[[1,"VALID"],[2,"VALID"],[3,"INVALID"]]);
-  assert.deepEqual(await getImportSummary(client,"LIVE-Q-1"),{importId:"LIVE-Q-1",schemaVersion:"test-v1",status:"FAILED",rowCount:3,validRowCount:2,invalidRowCount:1,pendingRowCount:0,errorCount:1,warningCount:1});
+  assert.deepEqual(await getImportSummary(client,"LIVE-Q-1"),{sourceKind:null,sourceName:null,sourceSizeBytes:null,sourceSha256:null,sourcePath:null,importId:"LIVE-Q-1",schemaVersion:"test-v1",status:"FAILED",rowCount:3,validRowCount:2,invalidRowCount:1,pendingRowCount:0,errorCount:1,warningCount:1});
   assert.equal(await getImportBatch(client,"MISSING"),null); assert.equal(await getImportSummary(client,"MISSING"),null); assert.deepEqual(await listImportRows(client,"MISSING"),[]); assert.deepEqual(await listImportIssues(client,"MISSING"),[]);
 }); });
 

@@ -2,7 +2,17 @@ import type { Queryable } from "../ingestion/persist-record-staging.js";
 
 export type ImportBatchStatus = "RECEIVED" | "VALIDATING" | "VALIDATED" | "FAILED";
 
-export type ImportBatch = {
+export type ImportSourceKind = "CSV_TEXT" | "LOCAL_FILE";
+
+export type ImportSourceMetadata = {
+  sourceKind: ImportSourceKind | null;
+  sourceName: string | null;
+  sourceSizeBytes: number | null;
+  sourceSha256: string | null;
+  sourcePath: string | null;
+};
+
+export type ImportBatch = ImportSourceMetadata & {
   importId: string;
   schemaVersion: string;
   status: ImportBatchStatus;
@@ -34,7 +44,7 @@ export type ImportIssue = {
   detail: string;
 };
 
-export type ImportSummary = {
+export type ImportSummary = ImportSourceMetadata & {
   importId: string;
   schemaVersion: string;
   status: ImportBatchStatus;
@@ -46,7 +56,15 @@ export type ImportSummary = {
   warningCount: number;
 };
 
-type BatchRow = {
+type SourceRow = {
+  source_kind: ImportSourceKind | null;
+  source_name: string | null;
+  source_size_bytes: string | number | null;
+  source_sha256: string | null;
+  source_path: string | null;
+};
+
+type BatchRow = SourceRow & {
   import_id: string;
   schema_version: string;
   status: ImportBatchStatus;
@@ -74,7 +92,7 @@ type IssueRow = {
   detail: string;
 };
 
-type SummaryRow = {
+type SummaryRow = SourceRow & {
   import_id: string;
   schema_version: string;
   status: ImportBatchStatus;
@@ -86,8 +104,19 @@ type SummaryRow = {
   warning_count: string | number;
 };
 
+function mapImportSource(row: SourceRow): ImportSourceMetadata {
+  return {
+    sourceKind: row.source_kind,
+    sourceName: row.source_name,
+    sourceSizeBytes: row.source_size_bytes === null ? null : Number(row.source_size_bytes),
+    sourceSha256: row.source_sha256,
+    sourcePath: row.source_path,
+  };
+}
+
 function mapImportBatch(row: BatchRow): ImportBatch {
   return {
+    ...mapImportSource(row),
     importId: row.import_id,
     schemaVersion: row.schema_version,
     status: row.status,
@@ -122,6 +151,7 @@ function mapImportIssue(row: IssueRow): ImportIssue {
 
 function mapImportSummary(row: SummaryRow): ImportSummary {
   return {
+    ...mapImportSource(row),
     importId: row.import_id,
     schemaVersion: row.schema_version,
     status: row.status,
@@ -140,14 +170,17 @@ function isPostgresUniqueViolation(error: unknown): boolean {
 
 export async function createImportBatch(
   db: Queryable,
-  input: { importId: string; schemaVersion: string },
+  input: { importId: string; schemaVersion: string } & Partial<ImportSourceMetadata>,
 ): Promise<ImportBatch> {
   try {
     const result = await db.query<BatchRow>(
-      `insert into import_batch (import_id, schema_version, status)
-       values ($1, $2, 'RECEIVED')
-       returning import_id, schema_version, status, created_at, updated_at`,
-      [input.importId, input.schemaVersion],
+      `insert into import_batch
+         (import_id, schema_version, status, source_kind, source_name, source_size_bytes, source_sha256, source_path)
+       values ($1, $2, 'RECEIVED', $3, $4, $5, $6, $7)
+       returning import_id, schema_version, status, created_at, updated_at,
+         source_kind, source_name, source_size_bytes, source_sha256, source_path`,
+      [input.importId, input.schemaVersion, input.sourceKind ?? null, input.sourceName ?? null,
+        input.sourceSizeBytes ?? null, input.sourceSha256 ?? null, input.sourcePath ?? null],
     );
     return mapImportBatch(result.rows[0]);
   } catch (error) {
@@ -155,6 +188,22 @@ export async function createImportBatch(
       throw new Error(`Import batch already exists: ${input.importId}`);
     }
     throw error;
+  }
+}
+
+export async function updateImportSourceContentMetadata(
+  db: Queryable,
+  input: { importId: string; sourceSizeBytes: number; sourceSha256: string },
+): Promise<void> {
+  const result = await db.query(
+    `update import_batch
+     set source_size_bytes = $2, source_sha256 = $3
+     where import_id = $1 and status = 'RECEIVED'
+     returning import_id`,
+    [input.importId, input.sourceSizeBytes, input.sourceSha256],
+  );
+  if (result.rowCount !== 1) {
+    throw new Error("Import must be in RECEIVED status before updating source content metadata.");
   }
 }
 
@@ -189,7 +238,8 @@ export async function failImportBatch(
 
 export async function getImportBatch(db: Queryable, importId: string): Promise<ImportBatch | null> {
   const result = await db.query<BatchRow>(
-    `select import_id, schema_version, status, created_at, updated_at
+    `select import_id, schema_version, status, created_at, updated_at,
+       source_kind, source_name, source_size_bytes, source_sha256, source_path
      from import_batch
      where import_id = $1`,
     [importId],
@@ -250,6 +300,11 @@ export async function getImportSummary(db: Queryable, importId: string): Promise
        b.import_id,
        b.schema_version,
        b.status,
+       b.source_kind,
+       b.source_name,
+       b.source_size_bytes,
+       b.source_sha256,
+       b.source_path,
        coalesce(r.row_count, 0) as row_count,
        coalesce(r.valid_row_count, 0) as valid_row_count,
        coalesce(r.invalid_row_count, 0) as invalid_row_count,

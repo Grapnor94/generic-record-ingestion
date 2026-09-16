@@ -46,9 +46,9 @@ class MemoryImportDb {
       return { rowCount: null, rows: [] };
     }
     if (q.startsWith("insert into import_batch")) {
-      const [importId, schemaVersion] = values;
+      const [importId, schemaVersion, source_kind, source_name, source_size_bytes, source_sha256, source_path] = values;
       if (this.batches.has(importId)) throw Object.assign(new Error("duplicate"), { code: "23505" });
-      const row = { import_id: importId, schema_version: schemaVersion, status: "RECEIVED", created_at: new Date(), updated_at: new Date() };
+      const row = { source_kind, source_name, source_size_bytes, source_sha256, source_path, import_id: importId, schema_version: schemaVersion, status: "RECEIVED", created_at: new Date(), updated_at: new Date() };
       this.batches.set(importId, { ...row });
       return { rowCount: 1, rows: [row] };
     }

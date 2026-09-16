@@ -48,13 +48,14 @@ class MemoryImportDb {
 
     if (q.startsWith("insert into import_batch")) {
       this.batchInsertCount += 1;
-      const [importId, schemaVersion] = values;
+      const [importId, schemaVersion, source_kind, source_name, source_size_bytes, source_sha256, source_path] = values;
       if (this.batches.has(importId)) {
         throw Object.assign(new Error("duplicate"), { code: "23505" });
       }
       const row = {
         import_id: importId,
         schema_version: schemaVersion,
+        source_kind, source_name, source_size_bytes, source_sha256, source_path,
         status: "RECEIVED",
         created_at: new Date("2026-09-14T00:00:00Z"),
         updated_at: new Date("2026-09-14T00:00:00Z"),
@@ -156,6 +157,7 @@ class MemoryImportDb {
       return {
         rowCount: 1,
         rows: [{
+          ...batch,
           import_id: importId,
           schema_version: batch.schema_version,
           status: batch.status,
@@ -203,6 +205,7 @@ test("runRecordImport persists a valid CSV import and returns the committed summ
     importId: "import-ok",
     status: "VALIDATED",
     summary: {
+      sourceKind: null, sourceName: null, sourceSizeBytes: null, sourceSha256: null, sourcePath: null,
       importId: "import-ok",
       schemaVersion: "v1",
       status: "VALIDATED",
