@@ -26,10 +26,12 @@ export function prepareRecordStaging(input: {
   assertSupportedRecordHeaders(input.contract,input.headers);
   const rows=input.rows.map((incoming,index):PreparedRecord=>{
     const rawSourceRow={...incoming};
+    // Callbacks share a working row, never the retained raw snapshot.
+    const workingRow={...rawSourceRow};
     try {
-      const sourceRow=input.transform(rawSourceRow);
-      const recordId=input.getRecordId(rawSourceRow,sourceRow);
-      const diagnostics=[...(input.diagnose?.(rawSourceRow,sourceRow)??[])];
+      const sourceRow=input.transform(workingRow);
+      const recordId=input.getRecordId(workingRow,sourceRow);
+      const diagnostics=[...(input.diagnose?.(workingRow,sourceRow)??[])];
       return {rowNumber:index+1,recordId,rawSourceRow,sourceRow,diagnostics};
     } catch(error) {
       throw new RecordStagingCallbackError(index+1,error);
