@@ -1,10 +1,13 @@
 import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 import {
   createImportBatch,
   failImportBatch,
   getImportSummary,
+  updateImportSourceContentMetadata,
 } from "../db/imports.js";
 import type { Queryable } from "./persist-record-staging.js";
+import { sourceContentMetadata } from "./source-provenance.js";
 import {
   runRecordImportAfterBatch,
   type RunRecordImportResult,
@@ -62,11 +65,38 @@ export async function runRecordFileImport(
   await createImportBatch(input.db, {
     importId: input.importId,
     schemaVersion: input.contract.schemaVersion,
+    sourceKind: "LOCAL_FILE",
+    sourceName: basename(input.filePath),
   });
+
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(input.filePath);
+  } catch (error) {
+    return failedFileResult(input, error);
+  }
+
+  const contentMetadata = sourceContentMetadata(bytes);
+  try {
+    await updateImportSourceContentMetadata(input.db, {
+      importId: input.importId,
+      ...contentMetadata,
+    });
+  } catch (error) {
+    try {
+      await failImportBatch(input.db, {
+        importId: input.importId,
+        issueCode: "IMPORT_PROVENANCE_ERROR",
+        detail: errorDetail(error),
+      });
+    } catch {
+      // Recovery must never replace the original metadata persistence error.
+    }
+    throw error;
+  }
 
   let csvText: string;
   try {
-    const bytes = await readFile(input.filePath);
     csvText = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch (error) {
     return failedFileResult(input, error);

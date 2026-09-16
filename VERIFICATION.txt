@@ -57,3 +57,25 @@ Filesystem adapter V0.6 verification
 Execution environment note
 - Local live PostgreSQL was not executed because the working sandbox does not provide the required repository/network/PostgreSQL environment.
 - GitHub Actions PostgreSQL 18 service runs are the authoritative live-database verification source.
+
+
+Import Provenance V0.7 verification
+Date: 2026-09-15
+- Branch: feature/import-provenance; main was not modified or merged.
+- Verified merge-base: 14e088864b3f78af3914e084652ab14dce5accb5 (V0.6).
+- Original feature branch HEAD: 2d3df04 (approved design only beyond V0.6).
+- Clean pre-implementation baseline: npm run verify PASS (25 unit, 45 integration); live PostgreSQL suite 11/11 PASS.
+- Explicit RED/GREEN checkpoints executed for byte helper, migration/query API, CSV provenance and filesystem provenance/error handling.
+- No V0.6 lifecycle assertions removed or weakened; exact summary/migration expectations extended for the new fields/migration.
+- npm run verify: PASS; TypeScript typecheck, builds, 27/27 unit and 67/67 integration tests.
+- npm run build: PASS.
+- npm run test:postgres: PASS; 18/18 live PostgreSQL tests, zero skipped.
+- Local environment: Windows, Node 24.19.0, TypeScript 5.9.3, PostgreSQL 18.4; Git Bash runs the unchanged PostgreSQL gate.
+- Test tooling installed outside the repository in the task work directory; no runtime/test dependencies or lockfiles added to the repository.
+- Storage tests cover legacy rows in all lifecycle states, migration idempotency, kind/hash/size constraints, safe bigint mapping through both queries, duplicate content, and RECEIVED-only metadata updates.
+- Adapter tests cover UTF-8 byte counts, original bytes including BOM/CRLF, provenance before callbacks, parse/header/row failures, unreadable-file partial provenance, invalid-UTF-8 complete provenance, callback/persistence recovery and metadata-write failure.
+- Live metadata failure uses a PostgreSQL trigger to reject the content update and confirms IMPORT_PROVENANCE_ERROR, retained partial provenance, and no staged rows.
+- Independent review: no actionable findings.
+- No functional deviations from the user specification. source_size_bytes is bigint constrained to JavaScript's nonnegative safe-integer range.
+- The frozen design's post-merge gate is intentionally not performed because the user requires leaving the feature branch unmerged.
+- Final exact HEAD and remote CI result are reported outside this file after the documentation commit.

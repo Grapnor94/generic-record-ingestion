@@ -18,6 +18,7 @@ import type {
   StagingDiagnostic,
 } from "./types.js";
 import { UnsupportedRecordSchemaError } from "./validate-headers.js";
+import { sourceContentMetadata } from "./source-provenance.js";
 
 export type RunRecordImportInput = {
   db: Queryable;
@@ -141,6 +142,8 @@ export async function runRecordImport(
   await createImportBatch(input.db, {
     importId: input.importId,
     schemaVersion: input.contract.schemaVersion,
+    sourceKind: "CSV_TEXT",
+    ...sourceContentMetadata(Buffer.from(input.csvText, "utf8")),
   });
 
   return runRecordImportAfterBatch(input);

@@ -23,7 +23,11 @@ class ScriptedDb {
   }
 }
 
+const nullSourceRow = { source_kind: null, source_name: null, source_size_bytes: null, source_sha256: null, source_path: null };
+const nullSource = { sourceKind: null, sourceName: null, sourceSizeBytes: null, sourceSha256: null, sourcePath: null };
+
 const batchRow = {
+  ...nullSourceRow,
   import_id: "IMP-1",
   schema_version: "v1",
   status: "RECEIVED",
@@ -34,7 +38,7 @@ const batchRow = {
 test("createImportBatch inserts unchanged identifiers and maps the returned batch", async () => {
   const db = new ScriptedDb([{ result: { rowCount: 1, rows: [batchRow] } }]);
   const batch = await createImportBatch(db, { importId: " IMP-1 ", schemaVersion: " v1 " });
-  assert.deepEqual(db.calls[0].values, [" IMP-1 ", " v1 "]);
+  assert.deepEqual(db.calls[0].values, [" IMP-1 ", " v1 ", null, null, null, null, null]);
   assert.match(db.calls[0].sql, /insert into import_batch/i);
   assert.equal(batch.importId, "IMP-1");
   assert.equal(batch.schemaVersion, "v1");
@@ -111,6 +115,7 @@ test("getImportSummary maps independent aggregate counts including zeroes", asyn
     import_id: "IMP-1",
     schema_version: "v1",
     status: "FAILED",
+    ...nullSourceRow,
     row_count: "3",
     valid_row_count: "1",
     invalid_row_count: "1",
@@ -120,6 +125,7 @@ test("getImportSummary maps independent aggregate counts including zeroes", asyn
   }] } }]);
   const summary = await getImportSummary(db, "IMP-1");
   assert.deepEqual(summary, {
+    ...nullSource,
     importId: "IMP-1", schemaVersion: "v1", status: "FAILED",
     rowCount: 3, validRowCount: 1, invalidRowCount: 1, pendingRowCount: 1,
     errorCount: 2, warningCount: 4,
