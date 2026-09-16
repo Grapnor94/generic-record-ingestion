@@ -6,9 +6,12 @@ import { tmpdir } from "node:os";
 import pg from "pg";
 import { runMigrations } from "../../dist/db/migrations.js";
 import * as imports from "../../dist/db/imports.js";
+import { runRecordImport } from "../../dist/ingestion/run-record-import.js";
 
 const nullSource = { sourceKind: null, sourceName: null, sourceSizeBytes: null, sourceSha256: null, sourcePath: null };
 const hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+const contract = { schemaVersion: "v7", requiredHeaders: ["id", "name"] };
+const callbacks = { transform: row => ({ name: row.name }), getRecordId: row => row.id || null };
 function source(value) { return Object.fromEntries(Object.keys(nullSource).map(key => [key, value[key]])); }
 
 async function withDatabase(fn) {
@@ -94,4 +97,16 @@ test("content metadata update is limited to RECEIVED and preserves source identi
     assert.deepEqual(source(await imports.getImportBatch(db, "file")), source(batch));
   }
   await assert.rejects(() => imports.updateImportSourceContentMetadata(db, { importId: "missing", sourceSizeBytes: 0, sourceSha256: hash }), /RECEIVED/);
+}));
+
+test("live CSV imports expose exact text provenance including duplicate content attempts", async () => withDatabase(async db => {
+  await runMigrations(db);
+  for (const importId of ["text-a", "text-b"]) {
+    const result = await runRecordImport({ db, importId, contract, csvText: "abc", ...callbacks });
+    assert.equal(result.status, "FAILED");
+    const expected = { sourceKind: "CSV_TEXT", sourceName: null, sourceSizeBytes: 3, sourceSha256: hash, sourcePath: null };
+    assert.deepEqual(source(result.summary), expected);
+    assert.deepEqual(source(await imports.getImportBatch(db, importId)), expected);
+    assert.equal((await imports.listImportIssues(db, importId))[0].issueCode, "SCHEMA_HEADER_ERROR");
+  }
 }));

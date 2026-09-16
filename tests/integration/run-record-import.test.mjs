@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { runRecordImport } from "../../dist/ingestion/run-record-import.js";
 
 class MemoryImportDb {
@@ -183,6 +184,73 @@ const contract = {
 const transform = (row) => ({ name: row.name });
 const getRecordId = (row) => row.id || null;
 
+function assertTextSource(batch, csvText) {
+  assert.equal(batch.source_kind, "CSV_TEXT");
+  assert.equal(batch.source_name, null);
+  assert.equal(batch.source_path, null);
+  assert.equal(batch.source_size_bytes, Buffer.byteLength(csvText, "utf8"));
+  assert.equal(batch.source_sha256, createHash("sha256").update(csvText, "utf8").digest("hex"));
+}
+
+test("CSV provenance is durable while RECEIVED before callbacks and counts multibyte bytes", async () => {
+  const db = new MemoryImportDb();
+  const csvText = "id,name\n1,é😀\n";
+  let called = false;
+  const result = await runRecordImport({ ...baseInput(db, "unicode"), csvText, transform(row) {
+    called = true;
+    const batch = db.batches.get("unicode");
+    assert.equal(batch.status, "RECEIVED");
+    assertTextSource(batch, csvText);
+    return transform(row);
+  } });
+  assert.equal(called, true);
+  assert.equal(result.summary.sourceKind, "CSV_TEXT");
+  assert.equal(result.summary.sourceSizeBytes, 17);
+  assert.equal(result.summary.sourceSha256, db.batches.get("unicode").source_sha256);
+  assert.equal(result.summary.sourceName, null);
+  assert.equal(result.summary.sourcePath, null);
+});
+
+for (const [label, csvText, diagnose, code] of [
+  ["parse", 'id,name\n1,"bad\n', undefined, "CSV_PARSE_ERROR"],
+  ["header", "id,other\n1,Alice\n", undefined, "SCHEMA_HEADER_ERROR"],
+  ["row", "id,name\n1,Alice\n", () => [{ code: "BAD", severity: "ERROR", fieldKey: null, detail: "bad" }], "BAD"],
+]) {
+  test(`CSV ${label} failures retain complete provenance`, async () => {
+    const db = new MemoryImportDb();
+    const result = await runRecordImport({ ...baseInput(db, label), csvText, diagnose });
+    assert.equal(result.status, "FAILED");
+    assertTextSource(db.batches.get(label), csvText);
+    assert.equal(db.issues[0].issue_code, code);
+    assert.equal(result.summary.sourceSha256, db.batches.get(label).source_sha256);
+  });
+}
+
+for (const kind of ["callback", "persistence", "recovery"]) {
+  test(`CSV ${kind} exception retains provenance and original error identity`, async () => {
+    const db = new MemoryImportDb();
+    const original = new Error(kind);
+    const input = baseInput(db, kind);
+    if (kind === "callback") input.transform = () => { throw original; };
+    else db.stageInsertError = original;
+    if (kind === "recovery") db.batchIssueError = new Error("recovery failed");
+    await assert.rejects(() => runRecordImport(input), e => e === original);
+    assertTextSource(db.batches.get(kind), input.csvText);
+    assert.equal(db.batches.get(kind).status, kind === "recovery" ? "RECEIVED" : "FAILED");
+  });
+}
+
+test("identical CSV content remains accepted under different import IDs", async () => {
+  const db = new MemoryImportDb();
+  for (const id of ["same-a", "same-b"]) {
+    const result = await runRecordImport(baseInput(db, id));
+    assert.equal(result.status, "VALIDATED");
+    assertTextSource(db.batches.get(id), baseInput(db, id).csvText);
+  }
+  assert.equal(db.batches.get("same-a").source_sha256, db.batches.get("same-b").source_sha256);
+  assert.equal(db.stage.length, 2);
+});
+
 function baseInput(db, importId) {
   return {
     db,
@@ -205,7 +273,8 @@ test("runRecordImport persists a valid CSV import and returns the committed summ
     importId: "import-ok",
     status: "VALIDATED",
     summary: {
-      sourceKind: null, sourceName: null, sourceSizeBytes: null, sourceSha256: null, sourcePath: null,
+      sourceKind: "CSV_TEXT", sourceName: null, sourceSizeBytes: 22,
+      sourceSha256: "2e9f445b06e5ca0fb9638798078f6a239ea1fcace10e1dcfb70ceb3a3322ad44", sourcePath: null,
       importId: "import-ok",
       schemaVersion: "v1",
       status: "VALIDATED",
