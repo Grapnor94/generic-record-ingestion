@@ -48,3 +48,90 @@ test("callback exception is typed and preserves the original error identity",()=
     (error)=>error instanceof RecordStagingCallbackError && error.rowNumber===1 && error.cause===originalError && /row 1: cannot normalize/i.test(error.message),
   );
 });
+
+for (const callback of ["transform", "getRecordId", "diagnose"]) {
+  test(`${callback} mutations cannot rewrite preserved raw fields`, () => {
+    const incoming = record();
+    const expected = { ...incoming };
+    const callbacks = {
+      transform,
+      getRecordId,
+      diagnose: () => [],
+    };
+    const original = callbacks[callback];
+    callbacks[callback] = (row, canonical) => {
+      row.first_name = "Changed";
+      delete row.legacy_history_code;
+      row.added = "callback-only";
+      return original(row, canonical);
+    };
+    const result = prepareRecordStaging({ contract, headers, rows: [incoming], ...callbacks });
+    assert.deepEqual(result.rows[0].rawSourceRow, expected);
+    assert.deepEqual(incoming, expected);
+  });
+
+  test(`${callback} mutation before throwing preserves caller data and error identity`, () => {
+    const incoming = record();
+    const expected = { ...incoming };
+    const cause = new Error("callback failed");
+    const callbacks = { transform, getRecordId, diagnose: () => [] };
+    callbacks[callback] = (row) => {
+      row.first_name = "Changed";
+      delete row.legacy_history_code;
+      throw cause;
+    };
+    assert.throws(
+      () => prepareRecordStaging({ contract, headers, rows: [incoming], ...callbacks }),
+      error => error instanceof RecordStagingCallbackError && error.rowNumber === 1 && error.cause === cause,
+    );
+    assert.deepEqual(incoming, expected);
+  });
+}
+
+test("retained callback and canonical references cannot mutate the raw snapshot", () => {
+  const incoming = record();
+  const expected = { ...incoming };
+  const retained = [];
+  const result = prepareRecordStaging({
+    contract, headers, rows: [incoming],
+    transform: row => { retained.push(row); return row; },
+    getRecordId: row => { retained.push(row); return getRecordId(row); },
+    diagnose: row => { retained.push(row); return []; },
+  });
+  for (const row of retained) {
+    row.first_name = "Changed later";
+    delete row.legacy_history_code;
+  }
+  result.rows[0].sourceRow.status = "CHANGED";
+  assert.deepEqual(result.rows[0].rawSourceRow, expected);
+  assert.deepEqual(incoming, expected);
+});
+
+test("callbacks retain their order and shared working-row behavior", () => {
+  const order = [];
+  const result = prepareRecordStaging({
+    contract, headers, rows: [record()],
+    transform: row => {
+      order.push("transform");
+      row.status = "NORMALIZED";
+      return { status: row.status };
+    },
+    getRecordId: (row, canonical) => {
+      order.push("getRecordId");
+      assert.equal(row.status, "NORMALIZED");
+      assert.equal(canonical.status, "NORMALIZED");
+      row.region = "review";
+      return "R-001";
+    },
+    diagnose: (row, canonical) => {
+      order.push("diagnose");
+      assert.equal(row.region, "review");
+      assert.equal(canonical.status, "NORMALIZED");
+      return [{ code: "REVIEW", severity: "WARNING", detail: "Review requested." }];
+    },
+  });
+  assert.deepEqual(order, ["transform", "getRecordId", "diagnose"]);
+  assert.equal(result.rows[0].recordId, "R-001");
+  assert.equal(result.report.warningCount, 1);
+  assert.equal(result.report.canProceedToPersistence, true);
+});
