@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { runRecordFileImport } from "../../dist/ingestion/run-record-file-import.js";
 
@@ -51,6 +52,13 @@ class MemoryImportDb {
       const row = { source_kind, source_name, source_size_bytes, source_sha256, source_path, import_id: importId, schema_version: schemaVersion, status: "RECEIVED", created_at: new Date(), updated_at: new Date() };
       this.batches.set(importId, { ...row });
       return { rowCount: 1, rows: [row] };
+    }
+    if (q.startsWith("update import_batch") && q.includes("set source_size_bytes")) {
+      const batch = this.batches.get(values[0]);
+      if (!batch || batch.status !== "RECEIVED") return { rowCount: 0, rows: [] };
+      batch.source_size_bytes = values[1];
+      batch.source_sha256 = values[2];
+      return { rowCount: 1, rows: [{ import_id: values[0] }] };
     }
     if (q.startsWith("update import_batch") && q.includes("set status = 'failed'") && q.includes("status = 'received'")) {
       const batch = this.batches.get(values[0]);
@@ -104,7 +112,7 @@ class MemoryImportDb {
       if (!batch) return { rowCount: 0, rows: [] };
       const rows = this.stage.filter((row) => row.import_id === importId);
       const issues = this.issues.filter((issue) => issue.import_id === importId);
-      return { rowCount: 1, rows: [{ import_id: importId, schema_version: batch.schema_version, status: batch.status, row_count: rows.length, valid_row_count: rows.filter((r) => r.validation_status === "VALID").length, invalid_row_count: rows.filter((r) => r.validation_status === "INVALID").length, pending_row_count: rows.filter((r) => r.validation_status === "PENDING").length, error_count: issues.filter((i) => i.severity === "ERROR").length, warning_count: issues.filter((i) => i.severity === "WARNING").length }] };
+      return { rowCount: 1, rows: [{ ...batch, import_id: importId, schema_version: batch.schema_version, status: batch.status, row_count: rows.length, valid_row_count: rows.filter((r) => r.validation_status === "VALID").length, invalid_row_count: rows.filter((r) => r.validation_status === "INVALID").length, pending_row_count: rows.filter((r) => r.validation_status === "PENDING").length, error_count: issues.filter((i) => i.severity === "ERROR").length, warning_count: issues.filter((i) => i.severity === "WARNING").length }] };
     }
     throw new Error(`Unsupported SQL: ${q}`);
   }
@@ -128,6 +136,128 @@ async function csvFile(dir, contents, name = "records.csv") {
 function input(db, importId, filePath) {
   return { db, importId, contract, filePath, transform, getRecordId };
 }
+
+function assertFileSource(batch, filePath, bytes = null) {
+  assert.equal(batch.source_kind, "LOCAL_FILE");
+  assert.equal(batch.source_name, basename(filePath));
+  assert.equal(batch.source_path, null);
+  assert.equal(batch.source_size_bytes, bytes === null ? null : bytes.length);
+  assert.equal(batch.source_sha256, bytes === null ? null : createHash("sha256").update(bytes).digest("hex"));
+}
+
+test("filesystem provenance is partial before read and complete while RECEIVED before callbacks", async () => withTempDir(async dir => {
+  const db = new MemoryImportDb();
+  const filePath = join(dir, "unicode.csv");
+  const bytes = Buffer.from("\uFEFFid,name\r\n1,é😀\r\n", "utf8");
+  let updates = 0;
+  let transformed = false;
+  const observedDb = { async query(sql, values) {
+    if (/set source_size_bytes/i.test(sql)) {
+      updates++;
+      assert.equal(db.batches.get("timing").status, "RECEIVED");
+    }
+    const result = await db.query(sql, values);
+    if (/insert into import_batch/i.test(sql)) {
+      assertFileSource(db.batches.get("timing"), filePath);
+      // If the adapter reads before creating the durable batch, this file does not exist.
+      await writeFile(filePath, bytes);
+    }
+    return result;
+  } };
+  const result = await runRecordFileImport({ ...input(observedDb, "timing", filePath), transform(row) {
+    transformed = true;
+    assert.equal(updates, 1);
+    assert.equal(db.batches.get("timing").status, "RECEIVED");
+    assertFileSource(db.batches.get("timing"), filePath, bytes);
+    return transform(row);
+  } });
+  assert.equal(transformed, true);
+  assert.equal(result.status, "VALIDATED");
+  assert.equal(result.summary.sourceKind, "LOCAL_FILE");
+  assert.equal(result.summary.sourceName, "unicode.csv");
+  assert.equal(result.summary.sourcePath, null);
+  assert.equal(result.summary.sourceSizeBytes, bytes.length);
+  assert.equal(result.summary.sourceSha256, db.batches.get("timing").source_sha256);
+}));
+
+test("unreadable filesystem import retains partial provenance and FILE_READ_ERROR", async () => withTempDir(async dir => {
+  const db = new MemoryImportDb();
+  const filePath = join(dir, "absent.csv");
+  const result = await runRecordFileImport(input(db, "absent", filePath));
+  assertFileSource(db.batches.get("absent"), filePath);
+  assert.equal(result.summary.sourceSizeBytes, null);
+  assert.equal(result.summary.sourceSha256, null);
+  assert.equal(result.status, "FAILED");
+  assert.equal(db.issues[0].issue_code, "FILE_READ_ERROR");
+  assert.equal(db.stage.length, 0);
+}));
+
+for (const [label, bytes, diagnose, code] of [
+  ["utf8", Buffer.from([0xc3, 0x28]), undefined, "FILE_READ_ERROR"],
+  ["parse", Buffer.from('id,name\n1,"bad\n'), undefined, "CSV_PARSE_ERROR"],
+  ["header", Buffer.from("id,other\n1,Alice\n"), undefined, "SCHEMA_HEADER_ERROR"],
+  ["row", Buffer.from("id,name\n1,Alice\n"), () => [{ code: "BAD", severity: "ERROR", fieldKey: null, detail: "bad" }], "BAD"],
+]) {
+  test(`filesystem ${label} failure retains complete original-byte provenance`, async () => withTempDir(async dir => {
+    const db = new MemoryImportDb();
+    const filePath = await csvFile(dir, bytes);
+    const result = await runRecordFileImport({ ...input(db, label, filePath), diagnose });
+    assertFileSource(db.batches.get(label), filePath, bytes);
+    assert.equal(result.status, "FAILED");
+    assert.equal(result.summary.sourceSha256, db.batches.get(label).source_sha256);
+    assert.equal(db.issues[0].issue_code, code);
+  }));
+}
+
+for (const kind of ["callback", "persistence", "recovery"]) {
+  test(`filesystem ${kind} exception retains complete provenance and original error identity`, async () => withTempDir(async dir => {
+    const db = new MemoryImportDb();
+    const bytes = Buffer.from("id,name\n1,Alice\n");
+    const filePath = await csvFile(dir, bytes);
+    const original = new Error(kind);
+    const options = input(db, kind, filePath);
+    if (kind === "callback") options.transform = () => { throw original; };
+    else db.stageInsertError = original;
+    if (kind === "recovery") db.batchIssueError = new Error("recovery failed");
+    await assert.rejects(() => runRecordFileImport(options), e => e === original);
+    assertFileSource(db.batches.get(kind), filePath, bytes);
+    assert.equal(db.batches.get(kind).status, kind === "recovery" ? "RECEIVED" : "FAILED");
+  }));
+}
+
+for (const recoveryFailure of [null, "begin", "insert into import_issue", "rollback"]) {
+  test(`filesystem metadata database failure precedes decoding and preserves exception with recovery=${recoveryFailure}`, async () => withTempDir(async dir => {
+    const db = new MemoryImportDb();
+    const filePath = await csvFile(dir, Buffer.from([0xff]));
+    const original = new Error("metadata update failed");
+    const wrappedDb = { async query(sql, values) {
+      if (/set source_size_bytes/i.test(sql)) throw original;
+      if (recoveryFailure && sql.trim().toLowerCase().startsWith(recoveryFailure)) throw new Error("recovery failed");
+      if (recoveryFailure === "rollback" && /insert into import_issue/i.test(sql)) throw new Error("issue failed");
+      return db.query(sql, values);
+    } };
+    await assert.rejects(() => runRecordFileImport(input(wrappedDb, "metadata", filePath)), e => e === original);
+    assertFileSource(db.batches.get("metadata"), filePath);
+    assert.equal(db.stage.length, 0);
+    if (recoveryFailure === null) {
+      assert.equal(db.batches.get("metadata").status, "FAILED");
+      assert.equal(db.issues[0].issue_code, "IMPORT_PROVENANCE_ERROR");
+      assert.equal(db.issues[0].row_number, null);
+    }
+  }));
+}
+
+test("identical filesystem content under different IDs remains accepted", async () => withTempDir(async dir => {
+  const db = new MemoryImportDb();
+  const bytes = Buffer.from("id,name\n1,Alice\n");
+  const filePath = await csvFile(dir, bytes);
+  for (const id of ["same-a", "same-b"]) {
+    const result = await runRecordFileImport(input(db, id, filePath));
+    assert.equal(result.status, "VALIDATED");
+    assertFileSource(db.batches.get(id), filePath, bytes);
+  }
+  assert.equal(db.stage.length, 2);
+}));
 
 test("valid UTF-8 CSV file imports through the existing staging pipeline", async () => withTempDir(async (dir) => {
   const filePath = await csvFile(dir, "id,name\n1,Alice\n");

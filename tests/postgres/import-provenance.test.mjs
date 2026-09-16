@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import pg from "pg";
 import { runMigrations } from "../../dist/db/migrations.js";
 import * as imports from "../../dist/db/imports.js";
 import { runRecordImport } from "../../dist/ingestion/run-record-import.js";
+import { runRecordFileImport } from "../../dist/ingestion/run-record-file-import.js";
 
 const nullSource = { sourceKind: null, sourceName: null, sourceSizeBytes: null, sourceSha256: null, sourcePath: null };
 const hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -109,4 +111,42 @@ test("live CSV imports expose exact text provenance including duplicate content 
     assert.deepEqual(source(await imports.getImportBatch(db, importId)), expected);
     assert.equal((await imports.listImportIssues(db, importId))[0].issueCode, "SCHEMA_HEADER_ERROR");
   }
+}));
+
+test("live files retain original-byte provenance for success, invalid UTF-8 and unreadable paths", async () => withDatabase(async db => {
+  await runMigrations(db);
+  const dir = await mkdtemp(join(tmpdir(), "provenance-live-file-"));
+  try {
+    for (const [name, bytes, status] of [
+      ["bom.csv", Buffer.from("\uFEFFid,name\r\n1,é😀\r\n"), "VALIDATED"],
+      ["invalid.csv", Buffer.from([0xc3, 0x28]), "FAILED"],
+      ["absent.csv", null, "FAILED"],
+    ]) {
+      const filePath = join(dir, name);
+      if (bytes !== null) await writeFile(filePath, bytes);
+      const result = await runRecordFileImport({ db, importId: name, contract, filePath, ...callbacks });
+      const expected = { sourceKind: "LOCAL_FILE", sourceName: name, sourceSizeBytes: bytes === null ? null : bytes.length, sourceSha256: bytes === null ? null : createHash("sha256").update(bytes).digest("hex"), sourcePath: null };
+      assert.equal(result.status, status);
+      assert.deepEqual(source(result.summary), expected);
+      assert.deepEqual(source(await imports.getImportBatch(db, name)), expected);
+      if (status === "FAILED") assert.equal((await imports.listImportIssues(db, name))[0].issueCode, "FILE_READ_ERROR");
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+}));
+
+test("live provenance write failure terminalizes separately from FILE_READ_ERROR", async () => withDatabase(async db => {
+  await runMigrations(db);
+  await db.query(`create function reject_content_metadata() returns trigger language plpgsql as $$ begin raise exception 'metadata unavailable'; end $$`);
+  await db.query("create trigger reject_metadata before update of source_size_bytes on import_batch for each row execute function reject_content_metadata()");
+  const dir = await mkdtemp(join(tmpdir(), "provenance-live-error-"));
+  try {
+    const filePath = join(dir, "invalid.csv");
+    await writeFile(filePath, Buffer.from([0xff]));
+    await assert.rejects(() => runRecordFileImport({ db, importId: "db-error", contract, filePath, ...callbacks }), e => e.code === "P0001" && e.message === "metadata unavailable");
+    const batch = await imports.getImportBatch(db, "db-error");
+    assert.equal(batch.status, "FAILED");
+    assert.deepEqual(source(batch), { ...nullSource, sourceKind: "LOCAL_FILE", sourceName: "invalid.csv" });
+    assert.equal((await imports.listImportIssues(db, "db-error"))[0].issueCode, "IMPORT_PROVENANCE_ERROR");
+    assert.deepEqual(await imports.listImportRows(db, "db-error"), []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 }));
