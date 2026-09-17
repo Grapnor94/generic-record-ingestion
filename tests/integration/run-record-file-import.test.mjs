@@ -134,7 +134,14 @@ async function csvFile(dir, contents, name = "records.csv") {
 }
 
 function input(db, importId, filePath) {
-  return { db, importId, contract, filePath, transform, getRecordId };
+  return {
+    db: { kind: "CLIENT", client: db },
+    importId,
+    contract,
+    filePath,
+    transform,
+    getRecordId,
+  };
 }
 
 function assertFileSource(batch, filePath, bytes = null) {

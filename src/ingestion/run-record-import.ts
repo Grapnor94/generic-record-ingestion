@@ -11,8 +11,12 @@ import {
 } from "./prepare-record-staging.js";
 import {
   persistRecordStaging,
-  type Queryable,
 } from "./persist-record-staging.js";
+import {
+  withDedicatedConnection,
+  type PostgresDatabase,
+  type PostgresQueryable,
+} from "../db/postgres.js";
 import type {
   RecordSchemaContract,
   StagingDiagnostic,
@@ -21,7 +25,7 @@ import { UnsupportedRecordSchemaError } from "./validate-headers.js";
 import { sourceContentMetadata } from "./source-provenance.js";
 
 export type RunRecordImportInput = {
-  db: Queryable;
+  db: PostgresDatabase;
   importId: string;
   contract: RecordSchemaContract;
   csvText: string;
@@ -36,6 +40,10 @@ export type RunRecordImportInput = {
   ) => StagingDiagnostic[];
 };
 
+type RunRecordImportOnConnectionInput = Omit<RunRecordImportInput, "db"> & {
+  db: PostgresQueryable;
+};
+
 export type RunRecordImportResult = {
   importId: string;
   status: "VALIDATED" | "FAILED";
@@ -47,7 +55,7 @@ function errorDetail(error: unknown): string {
 }
 
 async function resultFromCommittedSummary(
-  db: Queryable,
+  db: PostgresQueryable,
   importId: string,
   status: "VALIDATED" | "FAILED",
 ): Promise<RunRecordImportResult> {
@@ -59,7 +67,7 @@ async function resultFromCommittedSummary(
 }
 
 async function bestEffortFail(
-  db: Queryable,
+  db: PostgresQueryable,
   importId: string,
   issueCode: string,
   detail: string,
@@ -72,7 +80,7 @@ async function bestEffortFail(
 }
 
 export async function runRecordImportAfterBatch(
-  input: RunRecordImportInput,
+  input: RunRecordImportOnConnectionInput,
 ): Promise<RunRecordImportResult> {
   let parsed: ReturnType<typeof parseCsvRecords>;
   try {
@@ -138,6 +146,13 @@ export async function runRecordImportAfterBatch(
 
 export async function runRecordImport(
   input: RunRecordImportInput,
+): Promise<RunRecordImportResult> {
+  return withDedicatedConnection(input.db, (client) =>
+    runRecordImportOnConnection({ ...input, db: client }));
+}
+
+async function runRecordImportOnConnection(
+  input: RunRecordImportOnConnectionInput,
 ): Promise<RunRecordImportResult> {
   await createImportBatch(input.db, {
     importId: input.importId,

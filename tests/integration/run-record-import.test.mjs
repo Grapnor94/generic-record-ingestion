@@ -253,7 +253,7 @@ test("identical CSV content remains accepted under different import IDs", async 
 
 function baseInput(db, importId) {
   return {
-    db,
+    db: { kind: "CLIENT", client: db },
     importId,
     contract,
     csvText: "id,name\n1,Alice\n",
@@ -261,6 +261,31 @@ function baseInput(db, importId) {
     getRecordId,
   };
 }
+
+test("pool workflow acquires and releases one dedicated connection", async () => {
+  const client = new MemoryImportDb();
+  client.releaseCalls = 0;
+  client.release = function release() { this.releaseCalls += 1; };
+  const pool = {
+    connectCalls: 0,
+    async connect() {
+      this.connectCalls += 1;
+      return client;
+    },
+    async query() {
+      throw new Error("workflow must not use pool.query");
+    },
+  };
+
+  const result = await runRecordImport({
+    ...baseInput(client, "pool-import"),
+    db: { kind: "POOL", pool },
+  });
+
+  assert.equal(result.status, "VALIDATED");
+  assert.equal(pool.connectCalls, 1);
+  assert.equal(client.releaseCalls, 1);
+});
 
 test("runRecordImport persists a valid CSV import and returns the committed summary", async () => {
   const db = new MemoryImportDb();

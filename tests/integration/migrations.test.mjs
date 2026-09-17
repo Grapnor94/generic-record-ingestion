@@ -81,7 +81,10 @@ test("creates the migration ledger and applies pending migrations in order", asy
     },
     async (dir) => {
       const db = new FakeDb();
-      const result = await runMigrations(db, { migrationsDir: dir });
+      const result = await runMigrations(
+        { kind: "CLIENT", client: db },
+        { migrationsDir: dir },
+      );
       assert.deepEqual(result, {
         applied: ["0000_first.sql", "0001_second.sql"],
         skipped: [],
@@ -99,7 +102,10 @@ test("skips migrations already recorded in the ledger", async () => {
     },
     async (dir) => {
       const db = new FakeDb({ applied: ["0000_first.sql"] });
-      const result = await runMigrations(db, { migrationsDir: dir });
+      const result = await runMigrations(
+        { kind: "CLIENT", client: db },
+        { migrationsDir: dir },
+      );
       assert.deepEqual(result, {
         applied: ["0001_second.sql"],
         skipped: ["0000_first.sql"],
@@ -117,7 +123,10 @@ test("rolls back a failed migration and does not record it", async () => {
     async (dir) => {
       const db = new FakeDb({ failSql: "BROKEN" });
       await assert.rejects(
-        () => runMigrations(db, { migrationsDir: dir }),
+        () => runMigrations(
+          { kind: "CLIENT", client: db },
+          { migrationsDir: dir },
+        ),
         /Migration 0001_broken\.sql failed: synthetic migration failure/,
       );
       assert.deepEqual([...db.applied], ["0000_first.sql"]);

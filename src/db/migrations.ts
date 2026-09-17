@@ -1,7 +1,12 @@
 import { readFile, readdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Queryable } from "../ingestion/persist-record-staging.js";
+import {
+  withDedicatedConnection,
+  withTransaction,
+  type PostgresDatabase,
+  type PostgresQueryable,
+} from "./postgres.js";
 
 const MIGRATION_FILENAME = /^[0-9]{4}_.+\.sql$/;
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -39,8 +44,18 @@ function errorMessage(error: unknown): string {
 }
 
 export async function runMigrations(
-  db: Queryable,
+  database: PostgresDatabase,
   options: { migrationsDir?: string } = {},
+): Promise<{ applied: string[]; skipped: string[] }> {
+  return withDedicatedConnection(
+    database,
+    (client) => runMigrationsOnConnection(client, options),
+  );
+}
+
+async function runMigrationsOnConnection(
+  db: PostgresQueryable,
+  options: { migrationsDir?: string },
 ): Promise<{ applied: string[]; skipped: string[] }> {
   const migrationsDir = options.migrationsDir ?? DEFAULT_MIGRATIONS_DIR;
 
@@ -67,20 +82,20 @@ export async function runMigrations(
     }
 
     const sql = await readFile(migration.absolutePath, "utf8");
-    await db.query("begin");
     try {
-      await db.query(sql);
-      await db.query(
-        "insert into schema_migration (filename) values ($1)",
-        [migration.filename],
-      );
-      await db.query("commit");
+      await withTransaction(db, async (transaction) => {
+        await transaction.query(sql);
+        await transaction.query(
+          "insert into schema_migration (filename) values ($1)",
+          [migration.filename],
+        );
+      });
       appliedSet.add(migration.filename);
       applied.push(migration.filename);
     } catch (error) {
-      await db.query("rollback");
       throw new Error(
         `Migration ${migration.filename} failed: ${errorMessage(error)}`,
+        { cause: error },
       );
     }
   }

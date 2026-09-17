@@ -6,7 +6,11 @@ import {
   getImportSummary,
   updateImportSourceContentMetadata,
 } from "../db/imports.js";
-import type { Queryable } from "./persist-record-staging.js";
+import {
+  withDedicatedConnection,
+  type PostgresDatabase,
+  type PostgresQueryable,
+} from "../db/postgres.js";
 import { sourceContentMetadata } from "./source-provenance.js";
 import {
   runRecordImportAfterBatch,
@@ -18,7 +22,7 @@ import type {
 } from "./types.js";
 
 export type RunRecordFileImportInput = {
-  db: Queryable;
+  db: PostgresDatabase;
   importId: string;
   contract: RecordSchemaContract;
   filePath: string;
@@ -33,12 +37,17 @@ export type RunRecordFileImportInput = {
   ) => StagingDiagnostic[];
 };
 
+type RunRecordFileImportOnConnectionInput = Omit<
+  RunRecordFileImportInput,
+  "db"
+> & { db: PostgresQueryable };
+
 function errorDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
 async function failedFileResult(
-  input: RunRecordFileImportInput,
+  input: RunRecordFileImportOnConnectionInput,
   error: unknown,
 ): Promise<RunRecordImportResult> {
   await failImportBatch(input.db, {
@@ -61,6 +70,13 @@ async function failedFileResult(
 
 export async function runRecordFileImport(
   input: RunRecordFileImportInput,
+): Promise<RunRecordImportResult> {
+  return withDedicatedConnection(input.db, (client) =>
+    runRecordFileImportOnConnection({ ...input, db: client }));
+}
+
+async function runRecordFileImportOnConnection(
+  input: RunRecordFileImportOnConnectionInput,
 ): Promise<RunRecordImportResult> {
   await createImportBatch(input.db, {
     importId: input.importId,

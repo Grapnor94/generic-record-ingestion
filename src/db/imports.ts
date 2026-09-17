@@ -1,4 +1,7 @@
-import type { Queryable } from "../ingestion/persist-record-staging.js";
+import {
+  withTransaction,
+  type PostgresQueryable,
+} from "./postgres.js";
 
 export type ImportBatchStatus = "RECEIVED" | "VALIDATING" | "VALIDATED" | "FAILED";
 
@@ -169,7 +172,7 @@ function isPostgresUniqueViolation(error: unknown): boolean {
 }
 
 export async function createImportBatch(
-  db: Queryable,
+  db: PostgresQueryable,
   input: { importId: string; schemaVersion: string } & Partial<ImportSourceMetadata>,
 ): Promise<ImportBatch> {
   try {
@@ -192,7 +195,7 @@ export async function createImportBatch(
 }
 
 export async function updateImportSourceContentMetadata(
-  db: Queryable,
+  db: PostgresQueryable,
   input: { importId: string; sourceSizeBytes: number; sourceSha256: string },
 ): Promise<void> {
   const result = await db.query(
@@ -208,12 +211,11 @@ export async function updateImportSourceContentMetadata(
 }
 
 export async function failImportBatch(
-  db: Queryable,
+  db: PostgresQueryable,
   input: { importId: string; issueCode: string; detail: string },
 ): Promise<void> {
-  await db.query("begin");
-  try {
-    const transition = await db.query(
+  await withTransaction(db, async (transaction) => {
+    const transition = await transaction.query(
       `update import_batch
        set status = 'FAILED'
        where import_id = $1 and status = 'RECEIVED'
@@ -223,20 +225,16 @@ export async function failImportBatch(
     if (transition.rowCount !== 1) {
       throw new Error("Import must be in RECEIVED status before failure terminalization.");
     }
-    await db.query(
+    await transaction.query(
       `insert into import_issue
          (import_id, row_number, record_id, issue_code, severity, field_key, detail)
        values ($1, null, null, $2, 'ERROR', null, $3)`,
       [input.importId, input.issueCode, input.detail],
     );
-    await db.query("commit");
-  } catch (error) {
-    await db.query("rollback");
-    throw error;
-  }
+  });
 }
 
-export async function getImportBatch(db: Queryable, importId: string): Promise<ImportBatch | null> {
+export async function getImportBatch(db: PostgresQueryable, importId: string): Promise<ImportBatch | null> {
   const result = await db.query<BatchRow>(
     `select import_id, schema_version, status, created_at, updated_at,
        source_kind, source_name, source_size_bytes, source_sha256, source_path
@@ -248,7 +246,7 @@ export async function getImportBatch(db: Queryable, importId: string): Promise<I
 }
 
 export async function listImportRows(
-  db: Queryable,
+  db: PostgresQueryable,
   importId: string,
   options?: { status?: ImportRowStatus },
 ): Promise<ImportRow[]> {
@@ -269,7 +267,7 @@ export async function listImportRows(
 }
 
 export async function listImportIssues(
-  db: Queryable,
+  db: PostgresQueryable,
   importId: string,
   options?: { severity?: ImportIssueSeverity; rowNumber?: number },
 ): Promise<ImportIssue[]> {
@@ -294,7 +292,7 @@ export async function listImportIssues(
   return result.rows.map(mapImportIssue);
 }
 
-export async function getImportSummary(db: Queryable, importId: string): Promise<ImportSummary | null> {
+export async function getImportSummary(db: PostgresQueryable, importId: string): Promise<ImportSummary | null> {
   const result = await db.query<SummaryRow>(
     `select
        b.import_id,
