@@ -38,7 +38,8 @@ export function prepareRecordStaging(input: {
     }
   });
   for (const item of validateRecordIds(rows.map(({rowNumber,recordId})=>({rowNumber,recordId})))) {
-    const row=rows.find(r=>r.rowNumber===item.rowNumber);
+    // Row numbers are assigned above as contiguous, one-based array positions.
+    const row=rows[item.rowNumber-1];
     if (row) row.diagnostics.push(item.diagnostic);
   }
   const all=rows.flatMap(r=>r.diagnostics);
