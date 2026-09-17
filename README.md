@@ -125,3 +125,49 @@ npm run test:postgres
 ```
 
 The included `.github/workflows/postgres-integration.yml` provisions PostgreSQL 18 as a disposable service and runs both `npm run verify` and the live PostgreSQL gate.
+# Preparation package interface
+
+The private package exposes a preparation-only root interface for callers that
+already have parsed string records. It does not read files, decode bytes, connect
+to a database, or change import/publication state.
+
+```ts
+import {
+  prepareRecordStaging,
+  RecordStagingCallbackError,
+  UnsupportedRecordSchemaError,
+  type RecordSchemaContract,
+  type StagingDiagnostic,
+  type PreparedRecord,
+  type StagingReport,
+} from "generic-record-ingestion";
+
+const result = prepareRecordStaging({
+  contract: { schemaVersion: "EXAMPLE_V1", requiredHeaders: ["record_id", "label"] },
+  headers: ["record_id", "label"],
+  rows: [{ record_id: "R-1", label: "  Example  " }],
+  transform: row => ({ label: row.label.trim() }),
+  getRecordId: row => row.record_id,
+});
+// result.rows[0].rawSourceRow.label === "  Example  "
+// result.rows[0].sourceRow.label === "Example"
+```
+
+Header errors throw `UnsupportedRecordSchemaError`; callback failures throw
+`RecordStagingCallbackError` with the row number and original cause. ERROR
+diagnostics make `report.canProceedToPersistence` false; WARNING diagnostics do
+not. Callbacks share a working row separate from the preserved raw snapshot.
+
+Use `npm pack` to create a local artifact; its prepack step builds JavaScript and
+declarations. `npm run test:package` checks the real archive in an isolated ESM
+JavaScript/TypeScript consumer without installed runtime dependencies. It needs
+Node, npm, TypeScript from development dependencies, and `tar` on PATH.
+`npm run verify` includes this gate. The package remains private and retains its
+existing package version and dependency declarations; it has not been published
+to a registry. No CommonJS interface is promised.
+
+The supported root exports are the function, two error classes and four types
+shown above. Existing deep paths are not blocked by an exports map, but are not
+the stable preparation interface. Database/file orchestration remains available
+in the repository and is not re-exported from the root. Adoption by another
+application requires its own encoding, persistence and lifecycle review.
