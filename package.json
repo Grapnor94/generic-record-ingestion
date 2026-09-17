@@ -13,8 +13,10 @@
     "test": "npm run build && node --test tests/unit/*.test.mjs",
     "test:integration": "npm run build && node --test tests/integration/*.test.mjs",
     "test:package": "node --test tests/package/*.test.mjs",
+    "test:examples": "node --test tests/examples/*.test.mjs",
+    "example:inventory": "node scripts/run-inventory-example.mjs",
     "prepack": "npm run build",
-    "verify": "npm run typecheck && npm test && npm run test:integration && npm run test:package",
+    "verify": "npm run typecheck && npm test && npm run test:integration && npm run test:package && npm run test:examples",
     "test:postgres": "bash ./scripts/run-postgres-integration.sh",
     "db:migrate": "npm run build && node dist/db/migrate.js"
   },

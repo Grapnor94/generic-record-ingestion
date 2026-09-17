@@ -171,3 +171,35 @@ shown above. Existing deep paths are not blocked by an exports map, but are not
 the stable preparation interface. Database/file orchestration remains available
 in the repository and is not re-exported from the root. Adoption by another
 application requires its own encoding, persistence and lifecycle review.
+# Runnable synthetic inventory example
+
+From a development checkout with dependencies installed, run:
+
+```sh
+npm run example:inventory
+```
+
+The launcher packs this private library, extracts it into a temporary consumer,
+runs `examples/inventory.mjs` using the supported package-root import, and cleans
+up afterward. It needs Node, npm, and `tar` on PATH, uses no registry installation,
+and writes no database records. This is a preparation demonstration with parsed
+synthetic objects, not a CSV decoder, persistence adapter or scale benchmark.
+
+The JSON output contains four independent scenarios:
+
+| Scenario | Expected report |
+| --- | --- |
+| `clean` | No diagnostics; can proceed |
+| `warning` | One legacy-code warning; can proceed |
+| `invalidQuantity` | One invalid-quantity error; cannot proceed |
+| `duplicate` | One duplicate-ID error on the second row; cannot proceed |
+
+Compare `rawSourceRow` with `sourceRow`: whitespace and raw-only legacy codes
+remain in raw data, while canonical output contains only item name, quantity and
+warehouse. The inventory caller defines quantity normalization and its diagnostic
+rules; the library supplies missing/duplicate-ID validation and report aggregation.
+`canProceedToPersistence` describes validation, not an actual database operation.
+
+`npm run test:examples` executes the real launcher and verifies the results. It
+also runs as part of `npm run verify`. The example does not modify library
+lifecycle behavior or enable any application's production imports.
