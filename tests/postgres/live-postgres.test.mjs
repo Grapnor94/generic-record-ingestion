@@ -379,3 +379,87 @@ test("live filesystem import preserves downstream row-error semantics", async ()
   const result=await runRecordFileImport({db:clientDatabase(client),importId:"LIVE-F-3",contract:orchestrationContract,filePath,transform:orchestrationTransform,getRecordId:orchestrationRecordId,diagnose:()=>[{code:"LIVE_FILE_INVALID_NAME",severity:"ERROR",fieldKey:"name",detail:"Synthetic filesystem blocking diagnostic."}]});
   assert.equal(result.status,"FAILED"); assert.equal(result.summary.invalidRowCount,1); const rows=await listImportRows(client,"LIVE-F-3"); assert.equal(rows[0].validationStatus,"INVALID"); const issues=await listImportIssues(client,"LIVE-F-3"); assert.equal(issues[0].issueCode,"LIVE_FILE_INVALID_NAME"); assert.equal(issues[0].rowNumber,1);
 }); }));
+
+test("live staging claim and terminalization each advance the lifecycle clock", async () => withDatabase(async client => {
+  await runMigrations(clientDatabase(client));
+  const initial = await createImportBatch(client, { importId: "clock-stage", schemaVersion: "v1" });
+  const before = (await client.query("select updated_at::text as timestamp from import_batch where import_id = 'clock-stage'")).rows[0].timestamp;
+  let claimed;
+  let claimedTimestamp;
+  const observed = { async query(sql, values) {
+    const result = await client.query(sql, values);
+    if (/set status = 'VALIDATING'/i.test(sql)) {
+      claimed = await getImportBatch(client, "clock-stage");
+      claimedTimestamp = (await client.query("select updated_at::text as timestamp from import_batch where import_id = 'clock-stage'")).rows[0].timestamp;
+    }
+    return result;
+  } };
+  await persistRecordStaging(observed, { importId: "clock-stage", rows: [warningRow] });
+  const final = await getImportBatch(client, "clock-stage");
+  assert.equal((await client.query("select $2::timestamptz > $1::timestamptz as advanced", [before, claimedTimestamp])).rows[0].advanced, true);
+  assert.equal((await client.query("select updated_at > $1::timestamptz as advanced from import_batch where import_id = 'clock-stage'", [claimedTimestamp])).rows[0].advanced, true);
+  assert.deepEqual(claimed.createdAt, initial.createdAt);
+  assert.deepEqual(final.createdAt, initial.createdAt);
+}));
+
+for (const partial of [false, true]) test(`two simultaneous matching resumes claim one row set with ${partial ? "partial" : "complete"} provenance`, async () => withDatabase(async (client, schema) => {
+  const workflow = await import("../../dist/ingestion/durable-import.js").catch(() => ({}));
+  assert.equal(typeof workflow.resumeDurableImport, "function");
+  await runMigrations(clientDatabase(client));
+  const text = "id,name\n1,Ada\n";
+  const provenance = { sourceKind: "CSV_TEXT", sourceSizeBytes: Buffer.byteLength(text), sourceSha256: createHash("sha256").update(text).digest("hex") };
+  const initial = await createImportBatch(client, { importId: "race-resume", schemaVersion: "v1", ...(partial ? {} : provenance) });
+  const pool = new Pool({ ...connectionConfig, max: 2 });
+  let arrivals = 0; let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const database = { kind: "POOL", pool: guardedPool(pool, schema, connection => ({
+    release: () => connection.release(),
+    async query(sql, values) {
+      const result = await connection.query(sql, values);
+      if (/from import_batch\s+where import_id/i.test(sql) && ++arrivals <= 2) {
+        if (arrivals === 2) release();
+        await gate;
+      }
+      return result;
+    },
+  })) };
+  try {
+    const input = { database, importId: "race-resume", contract: { schemaVersion: "v1", requiredHeaders: ["id", "name"] }, source: { kind: "CSV_TEXT", text }, transform: row => ({ name: row.name }), getRecordId: row => row.id, diagnose: () => [{ code: "WARN", severity: "WARNING", detail: "one warning" }] };
+    const outcomes = await Promise.allSettled([workflow.resumeDurableImport(input), workflow.resumeDurableImport(input)]);
+    assert.equal(outcomes.filter(outcome => outcome.status === "fulfilled" && outcome.value.status === "VALIDATED").length, 1);
+    const rejected = outcomes.find(outcome => outcome.status === "rejected");
+    assert.ok(rejected.reason instanceof FrameworkError);
+    assert.equal(rejected.reason.code, "IMPORT_NOT_RESUMABLE");
+    assert.equal((await listImportRows(client, input.importId)).length, 1);
+    assert.equal((await listImportIssues(client, input.importId)).length, 1);
+    const final = await getImportBatch(client, input.importId);
+    for (const key of ["sourceKind", "sourceName", "sourceSizeBytes", "sourceSha256", "sourcePath", "createdAt"]) assert.deepEqual(final[key], key in provenance ? provenance[key] : initial[key]);
+  } finally { await pool.end(); }
+}));
+
+
+test("resume cannot overwrite provenance established after its initial read", async () => withDatabase(async client => {
+  const { resumeDurableImport } = await import("../../dist/ingestion/durable-import.js");
+  await runMigrations(clientDatabase(client));
+  await createImportBatch(client, { importId: "provenance-race", schemaVersion: "v1" });
+  let concurrentBatch;
+  let firstRead = true;
+  const observed = { async query(sql, values) {
+    const result = await client.query(sql, values);
+    if (firstRead && /from import_batch\s+where import_id/i.test(sql)) {
+      firstRead = false;
+      await client.query("update import_batch set source_sha256 = $1 where import_id = 'provenance-race'", ["0".repeat(64)]);
+      concurrentBatch = await getImportBatch(client, "provenance-race");
+    }
+    return result;
+  } };
+  await assert.rejects(() => resumeDurableImport({
+    database: clientDatabase(observed), importId: "provenance-race",
+    contract: { schemaVersion: "v1", requiredHeaders: ["id", "name"] },
+    source: { kind: "CSV_TEXT", text: "id,name\n1,Ada\n" },
+    transform: row => ({ name: row.name }), getRecordId: row => row.id,
+  }), error => error instanceof FrameworkError && error.code === "SOURCE_PROVENANCE_MISMATCH" && error.details.field === "sourceSha256");
+  assert.deepEqual(await getImportBatch(client, "provenance-race"), concurrentBatch);
+  assert.deepEqual(await listImportRows(client, "provenance-race"), []);
+  assert.deepEqual(await listImportIssues(client, "provenance-race"), []);
+}));

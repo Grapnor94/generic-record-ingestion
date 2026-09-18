@@ -151,3 +151,18 @@ test("live provenance write failure terminalizes separately from FILE_READ_ERROR
     assert.deepEqual(await imports.listImportRows(db, "db-error"), []);
   } finally { await rm(dir, { recursive: true, force: true }); }
 }));
+
+test("every batch mutation advances updatedAt while preserving createdAt", async () => withDatabase(async db => {
+  await runMigrations(database(db));
+  const initial = await imports.createImportBatch(db, { importId: "clock", schemaVersion: "v7" });
+  const before = (await db.query("select updated_at::text as timestamp from import_batch where import_id = 'clock'")).rows[0].timestamp;
+  await imports.updateImportSourceContentMetadata(db, { importId: "clock", sourceSizeBytes: 3, sourceSha256: hash });
+  const provenance = await imports.getImportBatch(db, "clock");
+  assert.equal((await db.query("select updated_at > $1::timestamptz as advanced from import_batch where import_id = 'clock'", [before])).rows[0].advanced, true);
+  assert.deepEqual(provenance.createdAt, initial.createdAt);
+  const afterProvenance = (await db.query("select updated_at::text as timestamp from import_batch where import_id = 'clock'")).rows[0].timestamp;
+  await imports.failImportBatch(db, { importId: "clock", issueCode: "TEST", detail: "failure" });
+  const failed = await imports.getImportBatch(db, "clock");
+  assert.equal((await db.query("select updated_at > $1::timestamptz as advanced from import_batch where import_id = 'clock'", [afterProvenance])).rows[0].advanced, true);
+  assert.deepEqual(failed.createdAt, initial.createdAt);
+}));

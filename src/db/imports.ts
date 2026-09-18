@@ -1,3 +1,4 @@
+import { FrameworkError } from "../errors.js";
 import {
   withTransaction,
   type PostgresQueryable,
@@ -209,7 +210,7 @@ export async function createImportBatch(
     return mapImportBatch(result.rows[0]);
   } catch (error) {
     if (isPostgresUniqueViolation(error)) {
-      throw new Error(`Import batch already exists: ${input.importId}`);
+      throw new FrameworkError("IMPORT_ALREADY_EXISTS", `Import batch already exists: ${input.importId}`, { cause: error });
     }
     throw error;
   }
@@ -221,7 +222,7 @@ export async function updateImportSourceContentMetadata(
 ): Promise<void> {
   const result = await db.query(
     `update import_batch
-     set source_size_bytes = $2, source_sha256 = $3
+     set source_size_bytes = $2, source_sha256 = $3, updated_at = clock_timestamp()
      where import_id = $1 and status = 'RECEIVED'
      returning import_id`,
     [input.importId, input.sourceSizeBytes, input.sourceSha256],
@@ -238,13 +239,13 @@ export async function failImportBatch(
   await withTransaction(db, async (transaction) => {
     const transition = await transaction.query(
       `update import_batch
-       set status = 'FAILED'
+       set status = 'FAILED', updated_at = clock_timestamp()
        where import_id = $1 and status = 'RECEIVED'
        returning import_id`,
       [input.importId],
     );
     if (transition.rowCount !== 1) {
-      throw new Error("Import must be in RECEIVED status before failure terminalization.");
+      throw new FrameworkError("IMPORT_NOT_RESUMABLE", "Import must be in RECEIVED status before failure terminalization.");
     }
     await transaction.query(
       `insert into import_issue
@@ -439,4 +440,37 @@ export async function getImportSummary(db: PostgresQueryable, importId: string):
     [importId],
   );
   return result.rows[0] ? mapImportSummary(result.rows[0]) : null;
+}
+
+
+/** @internal Compare only fields for which the attempt already has an identity. */
+export function assertImportProvenance(existing: ImportBatch, supplied: Partial<ImportSourceMetadata> & { schemaVersion?: string }): void {
+  for (const field of ["schemaVersion", "sourceKind", "sourceName", "sourceSizeBytes", "sourceSha256", "sourcePath"] as const) {
+    if (field in supplied && existing[field] !== null && existing[field] !== supplied[field]) {
+      throw new FrameworkError("SOURCE_PROVENANCE_MISMATCH", `Source provenance mismatch: ${field}`, { details: { field } });
+    }
+  }
+}
+
+/** @internal Fill missing identity atomically without claiming staging or retaining a new local path. */
+export async function completeImportSourceMetadata(db: PostgresQueryable, input: { importId: string; schemaVersion: string } & ImportSourceMetadata): Promise<void> {
+  const result = await db.query(
+    `update import_batch
+     set source_kind = coalesce(source_kind, $3), source_name = coalesce(source_name, $4),
+         source_size_bytes = coalesce(source_size_bytes, $5), source_sha256 = coalesce(source_sha256, $6),
+         updated_at = clock_timestamp()
+     where import_id = $1 and status = 'RECEIVED' and schema_version = $2
+       and (source_kind is null or source_kind = $3)
+       and (source_name is null or source_name = $4)
+       and (source_size_bytes is null or source_size_bytes = $5)
+       and (source_sha256 is null or source_sha256 = $6)
+       and (source_path is null or source_path = $7)
+     returning import_id`,
+    [input.importId, input.schemaVersion, input.sourceKind, input.sourceName, input.sourceSizeBytes, input.sourceSha256, input.sourcePath],
+  );
+  if (result.rowCount !== 1) {
+    const current = await getImportBatch(db, input.importId);
+    if (current && current.status === "RECEIVED") assertImportProvenance(current, input);
+    throw new FrameworkError("IMPORT_NOT_RESUMABLE", "Import must be in RECEIVED status before resume.");
+  }
 }
