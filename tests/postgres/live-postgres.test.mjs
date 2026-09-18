@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -7,7 +8,10 @@ import pg from "pg";
 import { runMigrations } from "../../dist/db/migrations.js";
 import { persistRecordStaging } from "../../dist/ingestion/persist-record-staging.js";
 import { runRecordImport } from "../../dist/ingestion/run-record-import.js";
-import { runRecordFileImport } from "../../dist/ingestion/run-record-file-import.js";
+import {
+  runRecordFileImport,
+  runRecordFileImportWithFileOperationsForTest,
+} from "../../dist/ingestion/run-record-file-import.js";
 import {
   createImportBatch,
   getImportBatch,
@@ -111,6 +115,92 @@ test("live orchestration durably records a pre-staging CSV failure", async () =>
 test("live orchestration persists row-level validation errors and fails the batch", async () => { await withDatabase(async (client) => {
   await runMigrations(clientDatabase(client)); const result=await runRecordImport({db:clientDatabase(client),importId:"LIVE-O-3",contract:orchestrationContract,csvText:"id,name\n1,Alice\n",transform:orchestrationTransform,getRecordId:orchestrationRecordId,diagnose:()=>[{code:"LIVE_INVALID_NAME",severity:"ERROR",fieldKey:"name",detail:"Synthetic live blocking diagnostic."}]});
   assert.equal(result.status,"FAILED"); assert.equal(result.summary.invalidRowCount,1); assert.equal((await listImportRows(client,"LIVE-O-3"))[0].validationStatus,"INVALID");
+}); });
+
+test("live oversized text import fails atomically with complete provenance", async () => { await withDatabase(async (client) => {
+  await runMigrations(clientDatabase(client));
+  const csvText = "id,name\n1,é😀\n";
+  const result = await runRecordImport({
+    db: clientDatabase(client), importId: "LIVE-LIMIT-TEXT", contract: orchestrationContract,
+    csvText, transform: orchestrationTransform, getRecordId: orchestrationRecordId,
+    limits: { maxSourceBytes: Buffer.byteLength(csvText, "utf8") - 1 },
+  });
+  const batch = await getImportBatch(client, "LIVE-LIMIT-TEXT");
+  assert.equal(result.status, "FAILED"); assert.equal(batch?.status, "FAILED");
+  assert.equal(batch?.sourceSizeBytes, Buffer.byteLength(csvText, "utf8"));
+  assert.equal(batch?.sourceSha256, createHash("sha256").update(csvText, "utf8").digest("hex"));
+  assert.deepEqual(await listImportRows(client, "LIVE-LIMIT-TEXT"), []);
+  assert.equal((await listImportIssues(client, "LIVE-LIMIT-TEXT"))[0].issueCode, "SOURCE_SIZE_LIMIT_EXCEEDED");
+}); });
+
+test("live file metadata overflow fails atomically with partial provenance", async () => withTempDir(async (dir) => { await withDatabase(async (client) => {
+  await runMigrations(clientDatabase(client));
+  const bytes = Buffer.from([0xff, 0xff]);
+  const filePath = join(dir, "metadata-overflow.csv"); await writeFile(filePath, bytes);
+  const result = await runRecordFileImport({
+    db: clientDatabase(client), importId: "LIVE-LIMIT-FILE-METADATA", contract: orchestrationContract,
+    filePath, transform: orchestrationTransform, getRecordId: orchestrationRecordId,
+    limits: { maxSourceBytes: 1 },
+  });
+  const batch = await getImportBatch(client, "LIVE-LIMIT-FILE-METADATA");
+  assert.equal(result.status, "FAILED"); assert.equal(batch?.status, "FAILED");
+  assert.equal(batch?.sourceName, "metadata-overflow.csv");
+  assert.equal(batch?.sourceSizeBytes, null); assert.equal(batch?.sourceSha256, null);
+  assert.deepEqual(await listImportRows(client, "LIVE-LIMIT-FILE-METADATA"), []);
+  assert.equal((await listImportIssues(client, "LIVE-LIMIT-FILE-METADATA"))[0].issueCode, "SOURCE_SIZE_LIMIT_EXCEEDED");
+}); }));
+
+test("live post-stat file growth fails atomically with exact provenance", async () => withTempDir(async (dir) => { await withDatabase(async (client) => {
+  await runMigrations(clientDatabase(client));
+  const bytes = Buffer.from("id,name\n1,Alice\n", "utf8");
+  const filePath = join(dir, "grew.csv");
+  const result = await runRecordFileImportWithFileOperationsForTest({
+    db: clientDatabase(client), importId: "LIVE-LIMIT-FILE-GROWTH", contract: orchestrationContract,
+    filePath, transform: orchestrationTransform, getRecordId: orchestrationRecordId,
+    limits: { maxSourceBytes: bytes.length - 1 },
+  }, {
+    stat: async () => ({ size: 1 }),
+    readFile: async () => bytes,
+  });
+  const batch = await getImportBatch(client, "LIVE-LIMIT-FILE-GROWTH");
+  assert.equal(result.status, "FAILED"); assert.equal(batch?.status, "FAILED");
+  assert.equal(batch?.sourceSizeBytes, bytes.length);
+  assert.equal(batch?.sourceSha256, createHash("sha256").update(bytes).digest("hex"));
+  assert.deepEqual(await listImportRows(client, "LIVE-LIMIT-FILE-GROWTH"), []);
+  assert.equal((await listImportIssues(client, "LIVE-LIMIT-FILE-GROWTH"))[0].issueCode, "SOURCE_SIZE_LIMIT_EXCEEDED");
+}); }));
+
+test("live row overflow fails atomically with complete file provenance", async () => withTempDir(async (dir) => { await withDatabase(async (client) => {
+  await runMigrations(clientDatabase(client));
+  const bytes = Buffer.from("id,name\n1,Alice\n2,Bob\n", "utf8");
+  const filePath = join(dir, "row-overflow.csv"); await writeFile(filePath, bytes);
+  const result = await runRecordFileImport({
+    db: clientDatabase(client), importId: "LIVE-LIMIT-ROWS", contract: orchestrationContract,
+    filePath, transform: orchestrationTransform, getRecordId: orchestrationRecordId,
+    limits: { maxDataRows: 1 },
+  });
+  const batch = await getImportBatch(client, "LIVE-LIMIT-ROWS");
+  assert.equal(result.status, "FAILED"); assert.equal(batch?.status, "FAILED");
+  assert.equal(batch?.sourceSizeBytes, bytes.length);
+  assert.equal(batch?.sourceSha256, createHash("sha256").update(bytes).digest("hex"));
+  assert.deepEqual(await listImportRows(client, "LIVE-LIMIT-ROWS"), []);
+  assert.equal((await listImportIssues(client, "LIVE-LIMIT-ROWS"))[0].issueCode, "ROW_LIMIT_EXCEEDED");
+}); }));
+
+test("live bounded imports still accept identical content under distinct IDs", async () => { await withDatabase(async (client) => {
+  await runMigrations(clientDatabase(client));
+  const csvText = "id,name\n1,Alice\n";
+  for (const importId of ["LIVE-LIMIT-SAME-A", "LIVE-LIMIT-SAME-B"]) {
+    const result = await runRecordImport({
+      db: clientDatabase(client), importId, contract: orchestrationContract,
+      csvText, transform: orchestrationTransform, getRecordId: orchestrationRecordId,
+      limits: { maxSourceBytes: Buffer.byteLength(csvText, "utf8"), maxDataRows: 1 },
+    });
+    assert.equal(result.status, "VALIDATED");
+  }
+  assert.equal((await listImportRows(client, "LIVE-LIMIT-SAME-A")).length, 1);
+  assert.equal((await listImportRows(client, "LIVE-LIMIT-SAME-B")).length, 1);
+  assert.equal((await getImportBatch(client, "LIVE-LIMIT-SAME-A"))?.sourceSha256, (await getImportBatch(client, "LIVE-LIMIT-SAME-B"))?.sourceSha256);
 }); });
 
 test("pg.Pool workflow uses one acquired connection and returns it after success", async () => { await withDatabase(async (client, schema) => {

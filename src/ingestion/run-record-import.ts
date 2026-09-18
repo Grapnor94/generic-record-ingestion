@@ -1,6 +1,7 @@
 import {
   DuplicateHeaderError,
   parseCsvRecords,
+  RowLimitExceededError,
 } from "../csv/parse-csv-records.js";
 import {
   createImportBatch,
@@ -26,6 +27,10 @@ import type {
 } from "./types.js";
 import { UnsupportedRecordSchemaError } from "./validate-headers.js";
 import { sourceContentMetadata } from "./source-provenance.js";
+import {
+  resolveIngestionLimits,
+  type IngestionLimits,
+} from "./limits.js";
 
 export type RunRecordImportInput = {
   db: PostgresDatabase;
@@ -41,10 +46,15 @@ export type RunRecordImportInput = {
     row: Record<string, string>,
     canonical: Record<string, unknown>,
   ) => StagingDiagnostic[];
+  limits?: Partial<IngestionLimits>;
 };
 
-type RunRecordImportOnConnectionInput = Omit<RunRecordImportInput, "db"> & {
+type RunRecordImportOnConnectionInput = Omit<
+  RunRecordImportInput,
+  "db" | "limits"
+> & {
   db: PostgresQueryable;
+  limits: IngestionLimits;
 };
 
 export type RunRecordImportResult = {
@@ -87,12 +97,22 @@ export async function runRecordImportAfterBatch(
 ): Promise<RunRecordImportResult> {
   let parsed: ReturnType<typeof parseCsvRecords>;
   try {
-    parsed = parseCsvRecords(input.csvText);
+    parsed = parseCsvRecords(input.csvText, {
+      maxDataRows: input.limits.maxDataRows,
+    });
   } catch (error) {
     if (error instanceof DuplicateHeaderError) {
       await failImportBatch(input.db, {
         importId: input.importId,
         issueCode: "DUPLICATE_HEADER",
+        detail: errorDetail(error),
+      });
+      return resultFromCommittedSummary(input.db, input.importId, "FAILED");
+    }
+    if (error instanceof RowLimitExceededError) {
+      await failImportBatch(input.db, {
+        importId: input.importId,
+        issueCode: "ROW_LIMIT_EXCEEDED",
         detail: errorDetail(error),
       });
       return resultFromCommittedSummary(input.db, input.importId, "FAILED");
@@ -158,19 +178,30 @@ export async function runRecordImportAfterBatch(
 export async function runRecordImport(
   input: RunRecordImportInput,
 ): Promise<RunRecordImportResult> {
+  const limits = resolveIngestionLimits(input.limits);
   return withDedicatedConnection(input.db, (client) =>
-    runRecordImportOnConnection({ ...input, db: client }));
+    runRecordImportOnConnection({ ...input, db: client, limits }));
 }
 
 async function runRecordImportOnConnection(
   input: RunRecordImportOnConnectionInput,
 ): Promise<RunRecordImportResult> {
+  const sourceBytes = Buffer.from(input.csvText, "utf8");
   await createImportBatch(input.db, {
     importId: input.importId,
     schemaVersion: input.contract.schemaVersion,
     sourceKind: "CSV_TEXT",
-    ...sourceContentMetadata(Buffer.from(input.csvText, "utf8")),
+    ...sourceContentMetadata(sourceBytes),
   });
+
+  if (sourceBytes.length > input.limits.maxSourceBytes) {
+    await failImportBatch(input.db, {
+      importId: input.importId,
+      issueCode: "SOURCE_SIZE_LIMIT_EXCEEDED",
+      detail: `Source size ${sourceBytes.length} bytes exceeds maxSourceBytes ${input.limits.maxSourceBytes}.`,
+    });
+    return resultFromCommittedSummary(input.db, input.importId, "FAILED");
+  }
 
   return runRecordImportAfterBatch(input);
 }

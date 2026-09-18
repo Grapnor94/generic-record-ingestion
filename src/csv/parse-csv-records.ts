@@ -21,6 +21,18 @@ export class DuplicateHeaderError extends Error {
   }
 }
 
+export class RowLimitExceededError extends Error {
+  readonly code = "ROW_LIMIT_EXCEEDED";
+
+  constructor(
+    readonly dataRowCount: number,
+    readonly maxDataRows: number,
+  ) {
+    super(`CSV data row count ${dataRowCount} exceeds maxDataRows ${maxDataRows}.`);
+    this.name = "RowLimitExceededError";
+  }
+}
+
 type CsvParserError = Error & {
   code?: string;
   lines?: number;
@@ -53,7 +65,10 @@ function parseRecords(source: string): string[][] {
   }
 }
 
-export function parseCsvRecords(input: string): ParsedCsvRecords {
+export function parseCsvRecords(
+  input: string,
+  options?: { maxDataRows: number },
+): ParsedCsvRecords {
   const source = input.startsWith("\uFEFF") ? input.slice(1) : input;
   const records = parseRecords(source);
 
@@ -76,6 +91,11 @@ export function parseCsvRecords(input: string): ParsedCsvRecords {
   );
   if (duplicates.length > 0) {
     throw new DuplicateHeaderError(duplicates);
+  }
+
+  const dataRowCount = records.length - 1;
+  if (options && dataRowCount > options.maxDataRows) {
+    throw new RowLimitExceededError(dataRowCount, options.maxDataRows);
   }
 
   const rows = records.slice(1).map((record, index) => {

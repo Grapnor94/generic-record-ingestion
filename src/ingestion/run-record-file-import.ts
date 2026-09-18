@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { basename } from "node:path";
 import {
   createImportBatch,
@@ -20,6 +20,17 @@ import type {
   RecordSchemaContract,
   StagingDiagnostic,
 } from "./types.js";
+import {
+  resolveIngestionLimits,
+  type IngestionLimits,
+} from "./limits.js";
+
+type FileOperations = {
+  stat(filePath: string): Promise<{ size: number }>;
+  readFile(filePath: string): Promise<Buffer>;
+};
+
+const defaultFileOperations: FileOperations = { stat, readFile };
 
 export type RunRecordFileImportInput = {
   db: PostgresDatabase;
@@ -35,12 +46,13 @@ export type RunRecordFileImportInput = {
     row: Record<string, string>,
     canonical: Record<string, unknown>,
   ) => StagingDiagnostic[];
+  limits?: Partial<IngestionLimits>;
 };
 
 type RunRecordFileImportOnConnectionInput = Omit<
   RunRecordFileImportInput,
-  "db"
-> & { db: PostgresQueryable };
+  "db" | "limits"
+> & { db: PostgresQueryable; limits: IngestionLimits };
 
 function errorDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -48,11 +60,12 @@ function errorDetail(error: unknown): string {
 
 async function failedFileResult(
   input: RunRecordFileImportOnConnectionInput,
+  issueCode: "FILE_READ_ERROR" | "SOURCE_SIZE_LIMIT_EXCEEDED",
   error: unknown,
 ): Promise<RunRecordImportResult> {
   await failImportBatch(input.db, {
     importId: input.importId,
-    issueCode: "FILE_READ_ERROR",
+    issueCode,
     detail: errorDetail(error),
   });
 
@@ -71,12 +84,32 @@ async function failedFileResult(
 export async function runRecordFileImport(
   input: RunRecordFileImportInput,
 ): Promise<RunRecordImportResult> {
+  return runRecordFileImportWithFileOperations(input, defaultFileOperations);
+}
+
+/** @internal Test-only seam for deterministic source-change scenarios. */
+export async function runRecordFileImportWithFileOperationsForTest(
+  input: RunRecordFileImportInput,
+  fileOperations: FileOperations,
+): Promise<RunRecordImportResult> {
+  return runRecordFileImportWithFileOperations(input, fileOperations);
+}
+
+async function runRecordFileImportWithFileOperations(
+  input: RunRecordFileImportInput,
+  fileOperations: FileOperations,
+): Promise<RunRecordImportResult> {
+  const limits = resolveIngestionLimits(input.limits);
   return withDedicatedConnection(input.db, (client) =>
-    runRecordFileImportOnConnection({ ...input, db: client }));
+    runRecordFileImportOnConnection(
+      { ...input, db: client, limits },
+      fileOperations,
+    ));
 }
 
 async function runRecordFileImportOnConnection(
   input: RunRecordFileImportOnConnectionInput,
+  fileOperations: FileOperations,
 ): Promise<RunRecordImportResult> {
   await createImportBatch(input.db, {
     importId: input.importId,
@@ -85,11 +118,28 @@ async function runRecordFileImportOnConnection(
     sourceName: basename(input.filePath),
   });
 
+  let sourceSize: number;
+  try {
+    sourceSize = (await fileOperations.stat(input.filePath)).size;
+  } catch (error) {
+    return failedFileResult(input, "FILE_READ_ERROR", error);
+  }
+
+  if (sourceSize > input.limits.maxSourceBytes) {
+    return failedFileResult(
+      input,
+      "SOURCE_SIZE_LIMIT_EXCEEDED",
+      new Error(
+        `Source size ${sourceSize} bytes exceeds maxSourceBytes ${input.limits.maxSourceBytes}.`,
+      ),
+    );
+  }
+
   let bytes: Buffer;
   try {
-    bytes = await readFile(input.filePath);
+    bytes = await fileOperations.readFile(input.filePath);
   } catch (error) {
-    return failedFileResult(input, error);
+    return failedFileResult(input, "FILE_READ_ERROR", error);
   }
 
   const contentMetadata = sourceContentMetadata(bytes);
@@ -111,11 +161,21 @@ async function runRecordFileImportOnConnection(
     throw error;
   }
 
+  if (bytes.length > input.limits.maxSourceBytes) {
+    return failedFileResult(
+      input,
+      "SOURCE_SIZE_LIMIT_EXCEEDED",
+      new Error(
+        `Source size ${bytes.length} bytes exceeds maxSourceBytes ${input.limits.maxSourceBytes}.`,
+      ),
+    );
+  }
+
   let csvText: string;
   try {
     csvText = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch (error) {
-    return failedFileResult(input, error);
+    return failedFileResult(input, "FILE_READ_ERROR", error);
   }
 
   return runRecordImportAfterBatch({
@@ -126,5 +186,6 @@ async function runRecordFileImportOnConnection(
     transform: input.transform,
     getRecordId: input.getRecordId,
     diagnose: input.diagnose,
+    limits: input.limits,
   });
 }

@@ -211,6 +211,85 @@ test("CSV provenance is durable while RECEIVED before callbacks and counts multi
   assert.equal(result.summary.sourcePath, null);
 });
 
+test("invalid CSV ingestion limits reject before creating a batch", async () => {
+  const db = new MemoryImportDb();
+
+  await assert.rejects(
+    () => runRecordImport({
+      ...baseInput(db, "invalid-limit"),
+      limits: { maxSourceBytes: 0 },
+    }),
+    { code: "INVALID_INGESTION_LIMIT" },
+  );
+
+  assert.equal(db.batchInsertCount, 0);
+  assert.equal(db.batches.size, 0);
+});
+
+test("CSV source exactly at its UTF-8 byte limit succeeds", async () => {
+  const db = new MemoryImportDb();
+  const csvText = "id,name\n1,é😀\n";
+  const result = await runRecordImport({
+    ...baseInput(db, "source-limit-exact"),
+    csvText,
+    limits: { maxSourceBytes: 17, maxDataRows: 1 },
+  });
+
+  assert.equal(result.status, "VALIDATED");
+  assert.equal(result.summary.rowCount, 1);
+  assertTextSource(db.batches.get("source-limit-exact"), csvText);
+});
+
+test("CSV source one byte over its UTF-8 limit fails durably before callbacks", async () => {
+  const db = new MemoryImportDb();
+  const csvText = "id,name\n1,é😀\n";
+  let callbackCalls = 0;
+  const result = await runRecordImport({
+    ...baseInput(db, "source-limit-over"),
+    csvText,
+    limits: { maxSourceBytes: 16, maxDataRows: 1 },
+    transform: () => { callbackCalls += 1; return {}; },
+    getRecordId: () => { callbackCalls += 1; return null; },
+    diagnose: () => { callbackCalls += 1; return []; },
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assertTextSource(db.batches.get("source-limit-over"), csvText);
+  assert.equal(db.issues[0].issue_code, "SOURCE_SIZE_LIMIT_EXCEEDED");
+  assert.equal(db.stage.length, 0);
+  assert.equal(callbackCalls, 0);
+});
+
+test("CSV data row limit is inclusive and overflow never stages a prefix", async () => {
+  const db = new MemoryImportDb();
+  const exact = await runRecordImport({
+    ...baseInput(db, "row-limit-exact"),
+    limits: { maxDataRows: 1 },
+  });
+
+  let callbackCalls = 0;
+  const overflowCsv = "id,name\n1,Alice\n2\n";
+  const overflow = await runRecordImport({
+    ...baseInput(db, "row-limit-over"),
+    csvText: overflowCsv,
+    limits: { maxDataRows: 1 },
+    transform: () => { callbackCalls += 1; return {}; },
+    getRecordId: () => { callbackCalls += 1; return null; },
+    diagnose: () => { callbackCalls += 1; return []; },
+  });
+
+  assert.equal(exact.status, "VALIDATED");
+  assert.equal(exact.summary.rowCount, 1);
+  assert.equal(overflow.status, "FAILED");
+  assert.equal(overflow.summary.rowCount, 0);
+  assertTextSource(db.batches.get("row-limit-over"), overflowCsv);
+  assert.equal(db.issues.find((issue) => issue.import_id === "row-limit-over").issue_code, "ROW_LIMIT_EXCEEDED");
+  assert.equal(db.stage.filter((row) => row.import_id === "row-limit-over").length, 0);
+  assert.equal(callbackCalls, 0);
+});
+
 for (const [label, csvText, diagnose, code] of [
   ["parse", 'id,name\n1,"bad\n', undefined, "CSV_PARSE_ERROR"],
   ["header", "id,other\n1,Alice\n", undefined, "SCHEMA_HEADER_ERROR"],
@@ -345,7 +424,7 @@ test("malformed CSV becomes a durable batch-level CSV_PARSE_ERROR", async () => 
 
 test("duplicate CSV headers become a durable batch-level DUPLICATE_HEADER before callbacks", async () => {
   const db = new MemoryImportDb();
-  const csvText = "id,name,name\n1,Alice,Alias\n";
+  const csvText = "id,name,name\n1,Alice,Alias\n2,Bob,Robert\n";
   let transformed = false;
   let recordIdRead = false;
   let diagnosed = false;
@@ -353,6 +432,7 @@ test("duplicate CSV headers become a durable batch-level DUPLICATE_HEADER before
   const result = await runRecordImport({
     ...baseInput(db, "import-duplicate-header"),
     csvText,
+    limits: { maxDataRows: 1 },
     transform: () => { transformed = true; return {}; },
     getRecordId: () => { recordIdRead = true; return null; },
     diagnose: () => { diagnosed = true; return []; },

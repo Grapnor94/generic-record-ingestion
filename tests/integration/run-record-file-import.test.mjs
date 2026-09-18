@@ -4,7 +4,10 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
-import { runRecordFileImport } from "../../dist/ingestion/run-record-file-import.js";
+import {
+  runRecordFileImport,
+  runRecordFileImportWithFileOperationsForTest,
+} from "../../dist/ingestion/run-record-file-import.js";
 
 class MemoryImportDb {
   constructor() {
@@ -187,6 +190,86 @@ test("filesystem provenance is partial before read and complete while RECEIVED b
   assert.equal(result.summary.sourceSha256, db.batches.get("timing").source_sha256);
 }));
 
+test("file metadata over the source limit prevents reading and retains partial provenance", async () => withTempDir(async dir => {
+  const db = new MemoryImportDb();
+  const filePath = join(dir, "metadata-too-large.csv");
+  let readCalls = 0;
+  const result = await runRecordFileImportWithFileOperationsForTest(
+    {
+      ...input(db, "metadata-too-large", filePath),
+      limits: { maxSourceBytes: 16 },
+    },
+    {
+      stat: async () => ({ size: 17 }),
+      readFile: async () => { readCalls += 1; return Buffer.from("unreachable"); },
+    },
+  );
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assertFileSource(db.batches.get("metadata-too-large"), filePath);
+  assert.equal(db.issues[0].issue_code, "SOURCE_SIZE_LIMIT_EXCEEDED");
+  assert.equal(db.stage.length, 0);
+  assert.equal(readCalls, 0);
+}));
+
+test("file growth after stat records exact provenance and fails before decoding", async () => withTempDir(async dir => {
+  const db = new MemoryImportDb();
+  const filePath = join(dir, "grew.csv");
+  const bytes = Buffer.from([0xff, 0xff]);
+  const result = await runRecordFileImportWithFileOperationsForTest(
+    {
+      ...input(db, "file-grew", filePath),
+      limits: { maxSourceBytes: 1 },
+    },
+    {
+      stat: async () => ({ size: 1 }),
+      readFile: async () => bytes,
+    },
+  );
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assertFileSource(db.batches.get("file-grew"), filePath, bytes);
+  assert.equal(db.issues[0].issue_code, "SOURCE_SIZE_LIMIT_EXCEEDED");
+  assert.equal(db.stage.length, 0);
+}));
+
+test("file source exactly at its byte limit succeeds", async () => withTempDir(async dir => {
+  const bytes = Buffer.from("id,name\n1,Alice\n", "utf8");
+  const filePath = await csvFile(dir, bytes);
+  const db = new MemoryImportDb();
+  const result = await runRecordFileImport({
+    ...input(db, "file-limit-exact", filePath),
+    limits: { maxSourceBytes: bytes.length, maxDataRows: 1 },
+  });
+
+  assert.equal(result.status, "VALIDATED");
+  assert.equal(result.summary.rowCount, 1);
+  assertFileSource(db.batches.get("file-limit-exact"), filePath, bytes);
+}));
+
+test("file row overflow is durable and never stages a prefix", async () => withTempDir(async dir => {
+  const bytes = Buffer.from("id,name\n1,Alice\n2,Bob\n", "utf8");
+  const filePath = await csvFile(dir, bytes);
+  const db = new MemoryImportDb();
+  let callbackCalls = 0;
+  const result = await runRecordFileImport({
+    ...input(db, "file-row-limit", filePath),
+    limits: { maxDataRows: 1 },
+    transform: () => { callbackCalls += 1; return {}; },
+    getRecordId: () => { callbackCalls += 1; return null; },
+    diagnose: () => { callbackCalls += 1; return []; },
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assertFileSource(db.batches.get("file-row-limit"), filePath, bytes);
+  assert.equal(db.issues[0].issue_code, "ROW_LIMIT_EXCEEDED");
+  assert.equal(db.stage.length, 0);
+  assert.equal(callbackCalls, 0);
+}));
+
 test("unreadable filesystem import retains partial provenance and FILE_READ_ERROR", async () => withTempDir(async dir => {
   const db = new MemoryImportDb();
   const filePath = join(dir, "absent.csv");
@@ -291,12 +374,17 @@ test("missing file becomes durable FILE_READ_ERROR with no staged rows", async (
 
 test("malformed UTF-8 becomes durable FILE_READ_ERROR with no staged rows", async () => withTempDir(async (dir) => {
   const filePath = join(dir, "invalid.csv");
-  await writeFile(filePath, Buffer.from([0x69, 0x64, 0x2c, 0x6e, 0x61, 0x6d, 0x65, 0x0a, 0x31, 0x2c, 0xc3, 0x28]));
+  const bytes = Buffer.from([0x69, 0x64, 0x2c, 0x6e, 0x61, 0x6d, 0x65, 0x0a, 0x31, 0x2c, 0xc3, 0x28]);
+  await writeFile(filePath, bytes);
   const db = new MemoryImportDb();
-  const result = await runRecordFileImport(input(db, "file-invalid-utf8", filePath));
+  const result = await runRecordFileImport({
+    ...input(db, "file-invalid-utf8", filePath),
+    limits: { maxSourceBytes: bytes.length },
+  });
   assert.equal(result.status, "FAILED");
   assert.equal(result.summary.errorCount, 1);
   assert.equal(db.stage.length, 0);
+  assertFileSource(db.batches.get("file-invalid-utf8"), filePath, bytes);
   assert.equal(db.issues[0].issue_code, "FILE_READ_ERROR");
 }));
 
