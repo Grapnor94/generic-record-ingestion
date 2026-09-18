@@ -29,10 +29,24 @@ export async function withDedicatedConnection<Value>(
   }
 
   const client = await database.pool.connect();
+  let hasPrimaryError = false;
+  let primaryError: unknown;
   try {
     return await work(client);
+  } catch (error) {
+    hasPrimaryError = true;
+    primaryError = error;
+    throw error;
   } finally {
-    client.release();
+    try {
+      client.release();
+    } catch (cleanupError) {
+      if (hasPrimaryError) {
+        retainCleanupError(primaryError, cleanupError);
+      } else {
+        throw cleanupError;
+      }
+    }
   }
 }
 
@@ -44,16 +58,20 @@ function retainCleanupError(primary: unknown, cleanup: unknown): void {
     return;
   }
 
-  const target = primary as { cleanupErrors?: unknown[] };
-  const cleanupErrors = Array.isArray(target.cleanupErrors)
-    ? [...target.cleanupErrors, cleanup]
-    : [cleanup];
-  Object.defineProperty(target, "cleanupErrors", {
-    configurable: true,
-    enumerable: false,
-    value: cleanupErrors,
-    writable: true,
-  });
+  try {
+    const target = primary as { cleanupErrors?: unknown[] };
+    const cleanupErrors = Array.isArray(target.cleanupErrors)
+      ? [...target.cleanupErrors, cleanup]
+      : [cleanup];
+    Object.defineProperty(target, "cleanupErrors", {
+      configurable: true,
+      enumerable: false,
+      value: cleanupErrors,
+      writable: true,
+    });
+  } catch {
+    // Cleanup annotation must never replace the primary operation error.
+  }
 }
 
 export async function withTransaction<Value>(

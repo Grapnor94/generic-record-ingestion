@@ -6,8 +6,9 @@ import {
 } from "../../dist/db/postgres.js";
 
 class RecordingClient {
-  constructor(failures = {}) {
+  constructor(failures = {}, releaseFailure = null) {
     this.failures = failures;
+    this.releaseFailure = releaseFailure;
     this.sql = [];
     this.receivers = [];
     this.releaseCalls = 0;
@@ -25,6 +26,9 @@ class RecordingClient {
 
   release() {
     this.releaseCalls += 1;
+    if (this.releaseFailure) {
+      throw this.releaseFailure;
+    }
   }
 }
 
@@ -124,6 +128,50 @@ test("rollback failures are retained as non-enumerable cleanup errors", async ()
       assert.equal(Object.prototype.propertyIsEnumerable.call(error, "cleanupErrors"), false);
       return true;
     },
+  );
+
+  assert.deepEqual(client.sql, ["begin", "rollback"]);
+});
+
+test("rollback and release failures stay secondary to the operation error", async () => {
+  const primary = new Error("work failed");
+  const rollbackFailure = new Error("rollback failed");
+  const releaseFailure = new Error("release failed");
+  const acquired = new RecordingClient(
+    { rollback: rollbackFailure },
+    releaseFailure,
+  );
+  const pool = recordingPool(acquired);
+
+  await assert.rejects(
+    () => withDedicatedConnection(
+      { kind: "POOL", pool },
+      (client) => withTransaction(client, async () => {
+        throw primary;
+      }),
+    ),
+    (error) => {
+      assert.equal(error, primary);
+      assert.deepEqual(error.cleanupErrors, [rollbackFailure, releaseFailure]);
+      assert.equal(Object.prototype.propertyIsEnumerable.call(error, "cleanupErrors"), false);
+      return true;
+    },
+  );
+
+  assert.deepEqual(acquired.sql, ["begin", "rollback"]);
+  assert.equal(acquired.releaseCalls, 1);
+});
+
+test("frozen primary errors survive rollback annotation failure", async () => {
+  const primary = Object.freeze(new Error("work failed"));
+  const rollbackFailure = new Error("rollback failed");
+  const client = new RecordingClient({ rollback: rollbackFailure });
+
+  await assert.rejects(
+    () => withTransaction(client, async () => {
+      throw primary;
+    }),
+    (error) => error === primary,
   );
 
   assert.deepEqual(client.sql, ["begin", "rollback"]);

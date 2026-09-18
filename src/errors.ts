@@ -15,7 +15,7 @@ export class FrameworkError extends Error {
 
   constructor(
     code: FrameworkErrorCode,
-    message = code,
+    message: string = code,
     options: {
       details?: Readonly<Record<string, unknown>>;
       cause?: unknown;
