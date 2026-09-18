@@ -6,8 +6,12 @@ import {
   getImportBatch,
   listImportRows,
   listImportIssues,
+  listImportRowsPage,
+  listImportIssuesPage,
   getImportSummary,
 } from "../../dist/db/imports.js";
+import { encodeIssueCursor, encodeRowCursor } from "../../dist/db/pagination.js";
+import { FrameworkError } from "../../dist/errors.js";
 
 class ScriptedDb {
   constructor(steps = []) {
@@ -107,6 +111,111 @@ test("listImportIssues orders deterministically and supports all filters", async
     assert.deepEqual(db.calls[0].values, values);
     assert.equal(issues[0].issueId, 7);
     assert.equal(issues[0].rowNumber, 2);
+  }
+});
+
+test("listImportRowsPage fetches one extra row and derives a cursor from the last returned row", async () => {
+  const rows = [1, 2, 3].map(rowNumber => ({
+    import_id: "IMP-1",
+    row_number: String(rowNumber),
+    record_id: `R-${rowNumber}`,
+    source_row: { rowNumber },
+    raw_source_row: null,
+    validation_status: rowNumber === 2 ? "INVALID" : "VALID",
+  }));
+  const db = new ScriptedDb([{ result: { rowCount: 3, rows } }]);
+
+  const page = await listImportRowsPage(db, "IMP-1", { pageSize: 2 });
+
+  assert.deepEqual(page.items.map(row => row.rowNumber), [1, 2]);
+  assert.equal(page.nextCursor, encodeRowCursor(2));
+  assert.match(db.calls[0].sql, /order by row_number asc\s+limit \$2/i);
+  assert.deepEqual(db.calls[0].values, ["IMP-1", 3]);
+});
+
+test("listImportRowsPage parameterizes status and cursor filters and returns a terminal page", async () => {
+  const db = new ScriptedDb([{ result: { rowCount: 1, rows: [{
+    import_id: "IMP-1",
+    row_number: "8",
+    record_id: "R-8",
+    source_row: { rowNumber: 8 },
+    raw_source_row: null,
+    validation_status: "INVALID",
+  }] } }]);
+  const cursor = encodeRowCursor(5);
+
+  const page = await listImportRowsPage(db, "IMP-1", {
+    pageSize: 2,
+    cursor,
+    status: "INVALID",
+  });
+
+  assert.deepEqual(page.items.map(row => row.rowNumber), [8]);
+  assert.equal(page.nextCursor, null);
+  assert.match(db.calls[0].sql, /validation_status = \$2/i);
+  assert.match(db.calls[0].sql, /row_number > \$3/i);
+  assert.match(db.calls[0].sql, /limit \$4/i);
+  assert.deepEqual(db.calls[0].values, ["IMP-1", "INVALID", 5, 3]);
+  assert.doesNotMatch(db.calls[0].sql, /row_number > 5/);
+});
+
+test("listImportIssuesPage preserves null-first keyset ordering across a page boundary", async () => {
+  const rows = [
+    { issue_id: "10", import_id: "IMP-1", row_number: null, record_id: null, issue_code: "A", severity: "ERROR", field_key: null, detail: "A" },
+    { issue_id: "12", import_id: "IMP-1", row_number: null, record_id: null, issue_code: "B", severity: "ERROR", field_key: null, detail: "B" },
+    { issue_id: "4", import_id: "IMP-1", row_number: "1", record_id: "R-1", issue_code: "C", severity: "WARNING", field_key: null, detail: "C" },
+  ];
+  const db = new ScriptedDb([{ result: { rowCount: 3, rows } }]);
+
+  const page = await listImportIssuesPage(db, "IMP-1", { pageSize: 2 });
+
+  assert.deepEqual(page.items.map(issue => [issue.rowNumber, issue.issueId]), [[null, 10], [null, 12]]);
+  assert.equal(page.nextCursor, encodeIssueCursor(null, 12));
+  assert.match(db.calls[0].sql, /order by row_number asc nulls first, issue_id asc\s+limit \$2/i);
+  assert.deepEqual(db.calls[0].values, ["IMP-1", 3]);
+});
+
+test("listImportIssuesPage parameterizes filters and both nullable cursor coordinates", async () => {
+  const cases = [
+    [encodeIssueCursor(null, 12), null],
+    [encodeIssueCursor(4, 19), 4],
+  ];
+  for (const [cursor, cursorRowNumber] of cases) {
+    const db = new ScriptedDb([{ result: { rowCount: 0, rows: [] } }]);
+    const page = await listImportIssuesPage(db, "IMP-1", {
+      pageSize: 5,
+      cursor,
+      severity: "ERROR",
+      rowNumber: 4,
+    });
+
+    assert.deepEqual(page, { items: [], nextCursor: null });
+    assert.match(db.calls[0].sql, /severity = \$2/i);
+    assert.match(db.calls[0].sql, /row_number = \$3/i);
+    assert.match(db.calls[0].sql, /\$4::bigint is null/i);
+    assert.match(db.calls[0].sql, /issue_id > \$5/i);
+    assert.match(db.calls[0].sql, /row_number > \$4/i);
+    assert.match(db.calls[0].sql, /row_number = \$4 and issue_id > \$5/i);
+    assert.match(db.calls[0].sql, /limit \$6/i);
+    assert.deepEqual(db.calls[0].values, ["IMP-1", "ERROR", 4, cursorRowNumber, cursorRowNumber === null ? 12 : 19, 6]);
+    assert.doesNotMatch(db.calls[0].sql, /issue_id > (12|19)/);
+  }
+});
+
+test("paginated import queries reject invalid cursors and page sizes before querying", async () => {
+  for (const call of [
+    db => listImportRowsPage(db, "IMP-1", { pageSize: 0 }),
+    db => listImportRowsPage(db, "IMP-1", { cursor: encodeIssueCursor(null, 1) }),
+    db => listImportIssuesPage(db, "IMP-1", { pageSize: 1001 }),
+    db => listImportIssuesPage(db, "IMP-1", { cursor: encodeRowCursor(1) }),
+  ]) {
+    const db = new ScriptedDb();
+    await assert.rejects(
+      () => call(db),
+      error => error instanceof FrameworkError
+        && (error.code === "INVALID_PAGE_SIZE" || error.code === "INVALID_CURSOR"),
+    );
+    assert.equal(db.calls.length, 0);
   }
 });
 

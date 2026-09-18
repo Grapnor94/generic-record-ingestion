@@ -17,8 +17,11 @@ import {
   getImportBatch,
   listImportRows,
   listImportIssues,
+  listImportRowsPage,
+  listImportIssuesPage,
   getImportSummary,
 } from "../../dist/db/imports.js";
+import { FrameworkError } from "../../dist/errors.js";
 
 const { Client, Pool } = pg;
 const connectionConfig = { host: process.env.PGHOST ?? "127.0.0.1", port: Number(process.env.PGPORT ?? "5432"), user: process.env.PGUSER ?? "postgres", password: process.env.PGPASSWORD ?? "postgres", database: process.env.PGDATABASE ?? "postgres" };
@@ -57,13 +60,18 @@ function assertPoolReturned(pool) {
 const warningRow = { rowNumber: 1, recordId: "R-1", rawSourceRow: { record_id: " R-1 ", first_name: " Ada ", legacy_history_code: " RAW-7 " }, sourceRow: { first_name: "Ada" }, diagnostics: [{ code: "LEGACY_VALUE", severity: "WARNING", fieldKey: "legacy_history_code", detail: "Legacy value retained in raw source." }] };
 
 test("migrations bootstrap an empty PostgreSQL schema and are idempotent", async () => { await withDatabase(async (client) => {
-  const first = await runMigrations(clientDatabase(client)); assert.deepEqual(first, { applied: ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql", "0002_add_import_provenance.sql"], skipped: [] });
+  const filenames = ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql", "0002_add_import_provenance.sql", "0003_add_import_query_indexes.sql"];
+  const first = await runMigrations(clientDatabase(client)); assert.deepEqual(first, { applied: filenames, skipped: [] });
   const tables = await client.query(`select table_name from information_schema.tables where table_schema = current_schema() and table_name in ('import_batch','import_stage_row','import_issue','schema_migration') order by table_name`);
   assert.deepEqual(tables.rows.map((r) => r.table_name), ["import_batch","import_issue","import_stage_row","schema_migration"]);
   const rawColumn = await client.query(`select data_type,is_nullable from information_schema.columns where table_schema=current_schema() and table_name='import_stage_row' and column_name='raw_source_row'`);
   assert.equal(rawColumn.rowCount,1); assert.equal(rawColumn.rows[0].data_type,"jsonb"); assert.equal(rawColumn.rows[0].is_nullable,"YES");
-  const ledger = await client.query("select filename from schema_migration order by filename"); assert.deepEqual(ledger.rows.map((r)=>r.filename),["0000_create_core_tables.sql","0001_add_raw_source_row.sql", "0002_add_import_provenance.sql"]);
-  const second = await runMigrations(clientDatabase(client)); assert.deepEqual(second,{applied:[],skipped:["0000_create_core_tables.sql","0001_add_raw_source_row.sql", "0002_add_import_provenance.sql"]});
+  const issueIndexes = await client.query("select indexname from pg_indexes where schemaname = current_schema() and tablename = 'import_issue' order by indexname");
+  assert.deepEqual(issueIndexes.rows.map(row => row.indexname), ["import_issue_import_row_issue_idx", "import_issue_pkey"]);
+  const stageIndexes = await client.query("select indexname from pg_indexes where schemaname = current_schema() and tablename = 'import_stage_row' order by indexname");
+  assert.deepEqual(stageIndexes.rows.map(row => row.indexname), ["import_stage_row_pkey"]);
+  const ledger = await client.query("select filename from schema_migration order by filename"); assert.deepEqual(ledger.rows.map((r)=>r.filename), filenames);
+  const second = await runMigrations(clientDatabase(client)); assert.deepEqual(second,{applied:[],skipped:filenames});
 }); });
 
 test("real persistence keeps raw/canonical JSON separate and warning nonblocking", async () => { await withDatabase(async (client) => {
@@ -115,6 +123,87 @@ test("live orchestration durably records a pre-staging CSV failure", async () =>
 test("live orchestration persists row-level validation errors and fails the batch", async () => { await withDatabase(async (client) => {
   await runMigrations(clientDatabase(client)); const result=await runRecordImport({db:clientDatabase(client),importId:"LIVE-O-3",contract:orchestrationContract,csvText:"id,name\n1,Alice\n",transform:orchestrationTransform,getRecordId:orchestrationRecordId,diagnose:()=>[{code:"LIVE_INVALID_NAME",severity:"ERROR",fieldKey:"name",detail:"Synthetic live blocking diagnostic."}]});
   assert.equal(result.status,"FAILED"); assert.equal(result.summary.invalidRowCount,1); assert.equal((await listImportRows(client,"LIVE-O-3"))[0].validationStatus,"INVALID");
+}); });
+
+test("live paginated queries are bounded, stable, filtered, and gap-free", async () => { await withDatabase(async (client) => {
+  await runMigrations(clientDatabase(client));
+  await client.query("insert into import_batch (import_id, schema_version, status) values ('PAGE-1', 'test-v1', 'RECEIVED'), ('PAGE-EMPTY', 'test-v1', 'RECEIVED')");
+  await client.query(`
+    insert into import_stage_row (import_id, row_number, record_id, source_row, validation_status)
+    select 'PAGE-1', row_number, 'R-' || row_number, jsonb_build_object('rowNumber', row_number),
+      case when row_number % 2 = 0 then 'INVALID' else 'VALID' end
+    from generate_series(1, 6) as row_number
+  `);
+  await client.query(`
+    insert into import_issue (import_id, row_number, record_id, issue_code, severity, detail)
+    values
+      ('PAGE-1', null, null, 'NULL-1', 'ERROR', 'null one'),
+      ('PAGE-1', null, null, 'NULL-2', 'WARNING', 'null two'),
+      ('PAGE-1', null, null, 'NULL-3', 'ERROR', 'null three'),
+      ('PAGE-1', 1, 'R-1', 'ROW-1', 'ERROR', 'row one'),
+      ('PAGE-1', 2, 'R-2', 'ROW-2A', 'WARNING', 'row two a'),
+      ('PAGE-1', 2, 'R-2', 'ROW-2B', 'ERROR', 'row two b'),
+      ('PAGE-1', 2, 'R-2', 'ROW-2C', 'ERROR', 'row two c')
+  `);
+
+  const collect = async (fetchPage, options) => {
+    const items = [];
+    let cursor;
+    let pageCount = 0;
+    do {
+      const page = await fetchPage({ ...options, ...(cursor === undefined ? {} : { cursor }) });
+      items.push(...page.items);
+      cursor = page.nextCursor ?? undefined;
+      pageCount += 1;
+    } while (cursor !== undefined);
+    return { items, pageCount };
+  };
+
+  const firstRows = await listImportRowsPage(client, "PAGE-1", { pageSize: 2 });
+  assert.deepEqual(await listImportRowsPage(client, "PAGE-1", { pageSize: 2 }), firstRows);
+  const rows = await collect(options => listImportRowsPage(client, "PAGE-1", options), { pageSize: 2 });
+  assert.equal(rows.pageCount, 3);
+  assert.deepEqual(rows.items.map(row => row.rowNumber), [1, 2, 3, 4, 5, 6]);
+
+  const invalidRows = await collect(options => listImportRowsPage(client, "PAGE-1", options), { pageSize: 1, status: "INVALID" });
+  assert.equal(invalidRows.pageCount, 3);
+  assert.deepEqual(invalidRows.items.map(row => row.rowNumber), [2, 4, 6]);
+
+  const firstIssues = await listImportIssuesPage(client, "PAGE-1", { pageSize: 2 });
+  assert.deepEqual(await listImportIssuesPage(client, "PAGE-1", { pageSize: 2 }), firstIssues);
+  const issues = await collect(options => listImportIssuesPage(client, "PAGE-1", options), { pageSize: 2 });
+  assert.equal(issues.pageCount, 4);
+  assert.deepEqual(issues.items.map(issue => [issue.rowNumber, issue.issueCode]), [
+    [null, "NULL-1"], [null, "NULL-2"], [null, "NULL-3"],
+    [1, "ROW-1"], [2, "ROW-2A"], [2, "ROW-2B"], [2, "ROW-2C"],
+  ]);
+
+  const errorIssues = await collect(options => listImportIssuesPage(client, "PAGE-1", options), { pageSize: 2, severity: "ERROR" });
+  assert.equal(errorIssues.pageCount, 3);
+  assert.deepEqual(errorIssues.items.map(issue => issue.issueCode), ["NULL-1", "NULL-3", "ROW-1", "ROW-2B", "ROW-2C"]);
+  const rowTwoIssues = await collect(options => listImportIssuesPage(client, "PAGE-1", options), { pageSize: 1, rowNumber: 2 });
+  assert.equal(rowTwoIssues.pageCount, 3);
+  assert.deepEqual(rowTwoIssues.items.map(issue => issue.issueCode), ["ROW-2A", "ROW-2B", "ROW-2C"]);
+
+  assert.deepEqual(await listImportRowsPage(client, "PAGE-EMPTY"), { items: [], nextCursor: null });
+  assert.deepEqual(await listImportIssuesPage(client, "PAGE-EMPTY"), { items: [], nextCursor: null });
+  assert.deepEqual(await listImportRowsPage(client, "MISSING"), { items: [], nextCursor: null });
+  assert.deepEqual(await listImportIssuesPage(client, "MISSING"), { items: [], nextCursor: null });
+  assert.equal((await listImportRowsPage(client, "PAGE-1", { pageSize: 1000 })).items.length, 6);
+  assert.equal((await listImportIssuesPage(client, "PAGE-1", { pageSize: 1000 })).items.length, 7);
+
+  for (const request of [
+    () => listImportRowsPage(client, "PAGE-1", { pageSize: Number.POSITIVE_INFINITY }),
+    () => listImportIssuesPage(client, "PAGE-1", { pageSize: 0 }),
+  ]) {
+    await assert.rejects(request, error => error instanceof FrameworkError && error.code === "INVALID_PAGE_SIZE");
+  }
+  for (const request of [
+    () => listImportRowsPage(client, "PAGE-1", { cursor: "not+base64url" }),
+    () => listImportIssuesPage(client, "PAGE-1", { cursor: "not+base64url" }),
+  ]) {
+    await assert.rejects(request, error => error instanceof FrameworkError && error.code === "INVALID_CURSOR");
+  }
 }); });
 
 test("live oversized text import fails atomically with complete provenance", async () => { await withDatabase(async (client) => {

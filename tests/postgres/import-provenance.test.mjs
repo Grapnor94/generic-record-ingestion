@@ -44,7 +44,7 @@ test("provenance migration preserves legacy rows in every lifecycle state", asyn
     }
     const before = (await db.query("select * from import_batch order by import_id")).rows;
     const migrated = await runMigrations(database(db));
-    assert.deepEqual(migrated.applied, ["0002_add_import_provenance.sql"]);
+    assert.deepEqual(migrated.applied, ["0002_add_import_provenance.sql", "0003_add_import_query_indexes.sql"]);
     for (const row of before) {
       const batch = await imports.getImportBatch(db, row.import_id);
       assert.deepEqual(source(batch), nullSource);

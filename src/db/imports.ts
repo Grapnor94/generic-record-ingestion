@@ -2,6 +2,14 @@ import {
   withTransaction,
   type PostgresQueryable,
 } from "./postgres.js";
+import {
+  decodeIssueCursor,
+  decodeRowCursor,
+  encodeIssueCursor,
+  encodeRowCursor,
+  validatePageSize,
+  type Page,
+} from "./pagination.js";
 
 export type ImportBatchStatus = "RECEIVED" | "VALIDATING" | "VALIDATED" | "FAILED";
 
@@ -45,6 +53,19 @@ export type ImportIssue = {
   severity: ImportIssueSeverity;
   fieldKey: string | null;
   detail: string;
+};
+
+export type ImportRowsPageOptions = {
+  pageSize?: number;
+  cursor?: string;
+  status?: ImportRowStatus;
+};
+
+export type ImportIssuesPageOptions = {
+  pageSize?: number;
+  cursor?: string;
+  severity?: ImportIssueSeverity;
+  rowNumber?: number;
 };
 
 export type ImportSummary = ImportSourceMetadata & {
@@ -290,6 +311,94 @@ export async function listImportIssues(
     values,
   );
   return result.rows.map(mapImportIssue);
+}
+
+export async function listImportRowsPage(
+  db: PostgresQueryable,
+  importId: string,
+  options: ImportRowsPageOptions = {},
+): Promise<Page<ImportRow>> {
+  const pageSize = validatePageSize(options.pageSize);
+  const cursor = options.cursor === undefined ? undefined : decodeRowCursor(options.cursor);
+  const values: unknown[] = [importId];
+  const filters: string[] = [];
+  if (options.status !== undefined) {
+    values.push(options.status);
+    filters.push(`validation_status = $${values.length}`);
+  }
+  if (cursor !== undefined) {
+    values.push(cursor.rowNumber);
+    filters.push(`row_number > $${values.length}`);
+  }
+  values.push(pageSize + 1);
+  const suffix = filters.length === 0 ? "" : ` and ${filters.join(" and ")}`;
+  const result = await db.query<StageRow>(
+    `select import_id, row_number, record_id, source_row, raw_source_row, validation_status
+     from import_stage_row
+     where import_id = $1${suffix}
+     order by row_number asc
+     limit $${values.length}`,
+    values,
+  );
+  const hasNextPage = result.rows.length > pageSize;
+  const items = result.rows.slice(0, pageSize).map(mapImportRow);
+  return {
+    items,
+    nextCursor: hasNextPage ? encodeRowCursor(items[items.length - 1].rowNumber) : null,
+  };
+}
+
+export async function listImportIssuesPage(
+  db: PostgresQueryable,
+  importId: string,
+  options: ImportIssuesPageOptions = {},
+): Promise<Page<ImportIssue>> {
+  const pageSize = validatePageSize(options.pageSize);
+  const cursor = options.cursor === undefined ? undefined : decodeIssueCursor(options.cursor);
+  const values: unknown[] = [importId];
+  const filters: string[] = [];
+  if (options.severity !== undefined) {
+    values.push(options.severity);
+    filters.push(`severity = $${values.length}`);
+  }
+  if (options.rowNumber !== undefined) {
+    values.push(options.rowNumber);
+    filters.push(`row_number = $${values.length}`);
+  }
+  if (cursor !== undefined) {
+    values.push(cursor.rowNumber);
+    const cursorRowNumberParameter = `$${values.length}`;
+    values.push(cursor.issueId);
+    const cursorIssueIdParameter = `$${values.length}`;
+    filters.push(
+      `(
+        (${cursorRowNumberParameter}::bigint is null and
+          ((row_number is null and issue_id > ${cursorIssueIdParameter}) or row_number is not null))
+        or
+        (${cursorRowNumberParameter}::bigint is not null and
+          (row_number > ${cursorRowNumberParameter} or
+            (row_number = ${cursorRowNumberParameter} and issue_id > ${cursorIssueIdParameter})))
+      )`,
+    );
+  }
+  values.push(pageSize + 1);
+  const suffix = filters.length === 0 ? "" : ` and ${filters.join(" and ")}`;
+  const result = await db.query<IssueRow>(
+    `select issue_id, import_id, row_number, record_id, issue_code, severity, field_key, detail
+     from import_issue
+     where import_id = $1${suffix}
+     order by row_number asc nulls first, issue_id asc
+     limit $${values.length}`,
+    values,
+  );
+  const hasNextPage = result.rows.length > pageSize;
+  const items = result.rows.slice(0, pageSize).map(mapImportIssue);
+  return {
+    items,
+    nextCursor: hasNextPage
+      ? encodeIssueCursor(items[items.length - 1].rowNumber, items[items.length - 1].issueId)
+      : null,
+  };
 }
 
 export async function getImportSummary(db: PostgresQueryable, importId: string): Promise<ImportSummary | null> {

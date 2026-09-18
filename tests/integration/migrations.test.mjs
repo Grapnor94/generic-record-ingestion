@@ -135,3 +135,14 @@ test("rolls back a failed migration and does not record it", async () => {
     },
   );
 });
+
+test("default migrations include the import issue pagination index in lexical order", async () => {
+  const db = new FakeDb();
+  const result = await runMigrations({ kind: "CLIENT", client: db });
+  assert.deepEqual(result.applied, [
+    "0000_create_core_tables.sql",
+    "0001_add_raw_source_row.sql",
+    "0002_add_import_provenance.sql",
+    "0003_add_import_query_indexes.sql",
+  ]);
+});
