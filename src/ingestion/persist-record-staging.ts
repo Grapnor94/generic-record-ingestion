@@ -9,11 +9,13 @@ export type Queryable = PostgresQueryable;
 
 export async function persistRecordStaging(
   db: PostgresQueryable,
-  input: { importId:string; rows:PreparedRecord[] },
+  input: { importId:string; rows:PreparedRecord[]; alreadyClaimed?: boolean },
 ): Promise<{status:"VALIDATED"|"FAILED"; issueCount:number}> {
   return withTransaction(db, async (transaction) => {
-    const transition=await transaction.query(`update import_batch set status = 'VALIDATING', updated_at = clock_timestamp() where import_id = $1 and status = 'RECEIVED' returning import_id`,[input.importId]);
-    if(transition.rowCount!==1) throw new FrameworkError("IMPORT_NOT_RESUMABLE", "Import must be in RECEIVED status before validation.");
+    if (!input.alreadyClaimed) {
+      const transition=await transaction.query(`update import_batch set status = 'VALIDATING', updated_at = clock_timestamp() where import_id = $1 and status = 'RECEIVED' returning import_id`,[input.importId]);
+      if(transition.rowCount!==1) throw new FrameworkError("IMPORT_NOT_RESUMABLE", "Import must be in RECEIVED status before validation.");
+    }
     for(const row of input.rows){
       await transaction.query(`insert into import_stage_row (import_id, row_number, record_id, source_row, raw_source_row, validation_status) values ($1,$2,$3,$4::jsonb,$5::jsonb,'PENDING')`,[input.importId,row.rowNumber,row.recordId?.trim()||null,JSON.stringify(row.sourceRow),JSON.stringify(row.rawSourceRow)]);
       for(const diagnostic of row.diagnostics){

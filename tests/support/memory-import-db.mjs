@@ -45,12 +45,13 @@ export class MemoryImportDb {
       this.batches.set(importId, { ...row });
       return { rowCount: 1, rows: [row] };
     }
-    if (q.startsWith("update import_batch") && q.includes("set source_kind = coalesce")) {
+    if (q.startsWith("update import_batch") && q.includes("source_kind = coalesce")) {
       const batch = this.batches.get(values[0]);
       if (!batch || batch.status !== "RECEIVED") return { rowCount: 0, rows: [] };
       const fields = ["schema_version", "source_kind", "source_name", "source_size_bytes", "source_sha256", "source_path"];
       if (fields.some((field, i) => batch[field] !== null && batch[field] !== values[i + 1])) return { rowCount: 0, rows: [] };
       fields.slice(1, 5).forEach((field, i) => { batch[field] ??= values[i + 2]; });
+      batch.status = "VALIDATING";
       return { rowCount: 1, rows: [{ import_id: values[0] }] };
     }
     if (q.startsWith("update import_batch") && q.includes("set source_size_bytes")) {
@@ -63,6 +64,12 @@ export class MemoryImportDb {
     if (q.startsWith("update import_batch") && q.includes("set status = 'failed'") && q.includes("status = 'received'")) {
       const batch = this.batches.get(values[0]);
       if (!batch || batch.status !== "RECEIVED") return { rowCount: 0, rows: [] };
+      batch.status = "FAILED";
+      return { rowCount: 1, rows: [{ import_id: values[0] }] };
+    }
+    if (q.startsWith("update import_batch") && q.includes("set status = 'failed'") && q.includes("status = 'validating'")) {
+      const batch = this.batches.get(values[0]);
+      if (!batch || batch.status !== "VALIDATING") return { rowCount: 0, rows: [] };
       batch.status = "FAILED";
       return { rowCount: 1, rows: [{ import_id: values[0] }] };
     }

@@ -480,11 +480,13 @@ for (const partial of [false, true]) test(`two simultaneous matching resumes cla
   const initial = await createImportBatch(client, { importId: "race-resume", schemaVersion: "v1", ...(partial ? {} : provenance) });
   const pool = new Pool({ ...connectionConfig, max: 2 });
   let arrivals = 0; let release;
+  let successfulProvenanceClaims = 0;
   const gate = new Promise(resolve => { release = resolve; });
   const database = { kind: "POOL", pool: guardedPool(pool, schema, connection => ({
     release: () => connection.release(),
     async query(sql, values) {
       const result = await connection.query(sql, values);
+      if (/source_kind = coalesce/i.test(sql) && result.rowCount === 1) successfulProvenanceClaims += 1;
       if (/from import_batch\s+where import_id/i.test(sql) && ++arrivals <= 2) {
         if (arrivals === 2) release();
         await gate;
@@ -496,6 +498,7 @@ for (const partial of [false, true]) test(`two simultaneous matching resumes cla
     const input = { database, importId: "race-resume", contract: { schemaVersion: "v1", requiredHeaders: ["id", "name"] }, source: { kind: "CSV_TEXT", text }, transform: row => ({ name: row.name }), getRecordId: row => row.id, diagnose: () => [{ code: "WARN", severity: "WARNING", detail: "one warning" }] };
     const outcomes = await Promise.allSettled([workflow.resumeDurableImport(input), workflow.resumeDurableImport(input)]);
     assert.equal(outcomes.filter(outcome => outcome.status === "fulfilled" && outcome.value.status === "VALIDATED").length, 1);
+    assert.equal(successfulProvenanceClaims, 1, "only the successful resume claimant may complete provenance");
     const rejected = outcomes.find(outcome => outcome.status === "rejected");
     assert.ok(rejected.reason instanceof FrameworkError);
     assert.equal(rejected.reason.code, "IMPORT_NOT_RESUMABLE");

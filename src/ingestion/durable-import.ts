@@ -1,7 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
 import { basename } from "node:path";
 import { DuplicateHeaderError, parseCsvRecords, RowLimitExceededError } from "../csv/parse-csv-records.js";
-import { createImportBatch, failImportBatch, getImportBatch, getImportSummary, updateImportSourceContentMetadata, completeImportSourceMetadata, assertImportProvenance, type ImportBatch, type ImportSummary } from "../db/imports.js";
+import { createImportBatch, failImportBatch, failClaimedImportBatch, getImportBatch, getImportSummary, updateImportSourceContentMetadata, completeImportSourceMetadata, assertImportProvenance, type ImportBatch, type ImportSummary } from "../db/imports.js";
 import { FrameworkError } from "../errors.js";
 import { prepareRecordStaging, RecordStagingCallbackError } from "./prepare-record-staging.js";
 import { persistRecordStaging } from "./persist-record-staging.js";
@@ -77,17 +77,17 @@ async function runOnConnection(input: ConnectionInput, mode: "START" | "RESUME",
     try { await updateImportSourceContentMetadata(input.db, { importId: input.importId, ...metadata }); }
     catch (error) { await bestEffortFail(input.db, input.importId, "IMPORT_PROVENANCE_ERROR", errorDetail(error)); throw error; }
   }
-  if (bytes.length > input.limits.maxSourceBytes) return failedSource(input, "SOURCE_SIZE_LIMIT_EXCEEDED", `Source size ${bytes.length} bytes exceeds maxSourceBytes ${input.limits.maxSourceBytes}.`);
+  if (bytes.length > input.limits.maxSourceBytes) return failedSource(input, "SOURCE_SIZE_LIMIT_EXCEEDED", `Source size ${bytes.length} bytes exceeds maxSourceBytes ${input.limits.maxSourceBytes}.`, existing !== null);
   let csvText: string;
   if (source.kind === "CSV_TEXT") csvText = source.text;
   else {
     try { csvText = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
-    catch (error) { return failedSource(input, "FILE_READ_ERROR", errorDetail(error)); }
+    catch (error) { return failedSource(input, "FILE_READ_ERROR", errorDetail(error), existing !== null); }
   }
-  return runRecordImportAfterBatch({ ...input, csvText });
+  return runRecordImportAfterBatch({ ...input, csvText }, existing !== null);
 }
-async function failedSource(input: ConnectionInput, issueCode: string, detail: string): Promise<DurableImportResult> {
-  await failImportBatch(input.db, { importId: input.importId, issueCode, detail });
+async function failedSource(input: ConnectionInput, issueCode: string, detail: string, alreadyClaimed = false): Promise<DurableImportResult> {
+  await (alreadyClaimed ? failClaimedImportBatch : failImportBatch)(input.db, { importId: input.importId, issueCode, detail });
   return resultFromCommittedSummary(input.db, input.importId, "FAILED");
 }
 function errorDetail(error: unknown): string {
@@ -121,7 +121,9 @@ async function bestEffortFail(
 
 async function runRecordImportAfterBatch(
   input: RunRecordImportOnConnectionInput,
+  alreadyClaimed = false,
 ): Promise<RunRecordImportResult> {
+  const fail = alreadyClaimed ? failClaimedImportBatch : failImportBatch;
   let parsed: ReturnType<typeof parseCsvRecords>;
   try {
     parsed = parseCsvRecords(input.csvText, {
@@ -129,7 +131,7 @@ async function runRecordImportAfterBatch(
     });
   } catch (error) {
     if (error instanceof DuplicateHeaderError) {
-      await failImportBatch(input.db, {
+      await fail(input.db, {
         importId: input.importId,
         issueCode: "DUPLICATE_HEADER",
         detail: errorDetail(error),
@@ -137,14 +139,14 @@ async function runRecordImportAfterBatch(
       return resultFromCommittedSummary(input.db, input.importId, "FAILED");
     }
     if (error instanceof RowLimitExceededError) {
-      await failImportBatch(input.db, {
+      await fail(input.db, {
         importId: input.importId,
         issueCode: "ROW_LIMIT_EXCEEDED",
         detail: errorDetail(error),
       });
       return resultFromCommittedSummary(input.db, input.importId, "FAILED");
     }
-    await failImportBatch(input.db, {
+    await fail(input.db, {
       importId: input.importId,
       issueCode: "CSV_PARSE_ERROR",
       detail: errorDetail(error),
@@ -164,7 +166,7 @@ async function runRecordImportAfterBatch(
     });
   } catch (error) {
     if (error instanceof UnsupportedRecordSchemaError) {
-      await failImportBatch(input.db, {
+      await fail(input.db, {
         importId: input.importId,
         issueCode: "SCHEMA_HEADER_ERROR",
         detail: errorDetail(error),
@@ -172,12 +174,7 @@ async function runRecordImportAfterBatch(
       return resultFromCommittedSummary(input.db, input.importId, "FAILED");
     }
     if (error instanceof RecordStagingCallbackError) {
-      await bestEffortFail(
-        input.db,
-        input.importId,
-        "STAGING_CALLBACK_ERROR",
-        errorDetail(error),
-      );
+      await bestEffortTerminalize(fail, input.db, input.importId, "STAGING_CALLBACK_ERROR", errorDetail(error));
       throw error.cause;
     }
     throw error;
@@ -188,16 +185,22 @@ async function runRecordImportAfterBatch(
     persisted = await persistRecordStaging(input.db, {
       importId: input.importId,
       rows: prepared.rows,
+      alreadyClaimed,
     });
   } catch (error) {
-    await bestEffortFail(
-      input.db,
-      input.importId,
-      "IMPORT_PERSISTENCE_ERROR",
-      errorDetail(error),
-    );
+    await bestEffortTerminalize(fail, input.db, input.importId, "IMPORT_PERSISTENCE_ERROR", errorDetail(error));
     throw error;
   }
 
   return resultFromCommittedSummary(input.db, input.importId, persisted.status);
+}
+
+async function bestEffortTerminalize(
+  fail: typeof failImportBatch,
+  db: PostgresQueryable,
+  importId: string,
+  issueCode: string,
+  detail: string,
+): Promise<void> {
+  try { await fail(db, { importId, issueCode, detail }); } catch { /* preserve the original exception */ }
 }

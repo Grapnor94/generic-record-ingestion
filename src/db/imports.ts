@@ -256,6 +256,31 @@ export async function failImportBatch(
   });
 }
 
+/** @internal Terminalize a resume attempt after it has exclusively claimed VALIDATING. */
+export async function failClaimedImportBatch(
+  db: PostgresQueryable,
+  input: { importId: string; issueCode: string; detail: string },
+): Promise<void> {
+  await withTransaction(db, async (transaction) => {
+    const transition = await transaction.query(
+      `update import_batch
+       set status = 'FAILED', updated_at = clock_timestamp()
+       where import_id = $1 and status = 'VALIDATING'
+       returning import_id`,
+      [input.importId],
+    );
+    if (transition.rowCount !== 1) {
+      throw new FrameworkError("IMPORT_NOT_RESUMABLE", "Claimed import must be in VALIDATING status before failure terminalization.");
+    }
+    await transaction.query(
+      `insert into import_issue
+         (import_id, row_number, record_id, issue_code, severity, field_key, detail)
+       values ($1, null, null, $2, 'ERROR', null, $3)`,
+      [input.importId, input.issueCode, input.detail],
+    );
+  });
+}
+
 export async function getImportBatch(db: PostgresQueryable, importId: string): Promise<ImportBatch | null> {
   const result = await db.query<BatchRow>(
     `select import_id, schema_version, status, created_at, updated_at,
@@ -452,11 +477,12 @@ export function assertImportProvenance(existing: ImportBatch, supplied: Partial<
   }
 }
 
-/** @internal Fill missing identity atomically without claiming staging or retaining a new local path. */
+/** @internal Fill missing identity and exclusively claim this RECEIVED attempt for resume. */
 export async function completeImportSourceMetadata(db: PostgresQueryable, input: { importId: string; schemaVersion: string } & ImportSourceMetadata): Promise<void> {
   const result = await db.query(
     `update import_batch
-     set source_kind = coalesce(source_kind, $3), source_name = coalesce(source_name, $4),
+     set status = 'VALIDATING',
+         source_kind = coalesce(source_kind, $3), source_name = coalesce(source_name, $4),
          source_size_bytes = coalesce(source_size_bytes, $5), source_sha256 = coalesce(source_sha256, $6),
          updated_at = clock_timestamp()
      where import_id = $1 and status = 'RECEIVED' and schema_version = $2
