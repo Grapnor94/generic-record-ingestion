@@ -1,34 +1,12 @@
 import test from "node:test";
-import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { spawnSync } from "node:child_process";
+import { run, withPackedConsumer } from "./packed-consumer.mjs";
 
 const require = createRequire(import.meta.url);
-const root = fileURLToPath(new URL("../../", import.meta.url));
 
-function run(command, args, cwd) {
-  const result = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 60_000 });
-  assert.ifError(result.error);
-  assert.equal(result.status, 0, `${command} ${args.join(" ")}\n${result.stdout}\n${result.stderr}`);
-  return result.stdout;
-}
-
-test("packed preparation API works in an isolated JavaScript and TypeScript consumer", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "generic-package-"));
-  try {
-    // Pack the actual artifact; do not link to the source checkout or install runtime dependencies.
-    assert.ok(process.env.npm_execpath, "Run this test through npm run test:package");
-    const output = run(process.execPath, [process.env.npm_execpath, "pack", "--json", "--cache", join(dir, "cache"), "--pack-destination", dir], root);
-    const packed = JSON.parse(output);
-    const archive = Array.isArray(packed) ? packed[0] : packed["generic-record-ingestion"];
-    const packageDir = join(dir, "node_modules", "generic-record-ingestion");
-    await mkdir(packageDir, { recursive: true });
-    run("tar", ["-xzf", join(dir, archive.filename), "-C", packageDir, "--strip-components=1"], dir);
-    await writeFile(join(dir, "package.json"), JSON.stringify({ type: "module" }));
+test("packed preparation API works without runtime dependencies in JavaScript and TypeScript", async () => withPackedConsumer(async dir => {
     await writeFile(join(dir, "consumer.mjs"), `
 import assert from "node:assert/strict";
 import { prepareRecordStaging, RecordStagingCallbackError, UnsupportedRecordSchemaError } from "generic-record-ingestion";
@@ -68,7 +46,4 @@ void [rows, report, callbackError, schemaError, invalid];
       noEmit: true, types: [], skipLibCheck: false,
     }, files: ["consumer.ts"] }));
     run(process.execPath, [resolve(require.resolve("typescript"), "../../bin/tsc"), "-p", join(dir, "tsconfig.json")], dir);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
+}));

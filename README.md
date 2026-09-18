@@ -1,205 +1,175 @@
 # Generic Record Ingestion
 
-A standalone, domain-neutral TypeScript ingestion framework for structured record imports.
+A domain-neutral TypeScript framework for bounded CSV ingestion and transactional PostgreSQL staging. It preserves raw source rows separately from canonical data, validates headers and record IDs, retains diagnostics and source provenance, and supports explicit recovery of interrupted attempts.
 
-It provides:
-- UTF-8 comma-separated CSV parsing with strict structural checks;
-- required/optional header validation with unknown-column rejection;
-- lossless raw-row copies kept separate from canonical transformer output;
-- caller-supplied record-ID extraction and diagnostics;
-- generic missing/duplicate record-ID validation;
-- deterministic warning/error staging reports;
-- transactional persistence of canonical and raw JSON rows;
-- warning/error persistence where warnings remain non-blocking;
-- import lifecycle/query APIs;
-- durable source provenance for each import attempt;
-- supported end-to-end CSV-text and local-filesystem import entry points.
+## Supported V0.8 package contract
 
-## Scope
+Import from `generic-record-ingestion`. The root exposes preparation, durable start/resume, attempt/summary reads, bounded row/issue pages, migrations, limits, errors, and their TypeScript contracts. These are intentional V0.8 contracts, not a claim of mature semantic-versioning guarantees. The package remains private at version `0.1.0`; no registry publication is implied. Node.js 22+ and ESM are supported; no CommonJS interface is promised.
 
-Production code and tests contain no political-domain attributes or mappings. The framework is intentionally generic.
+The exports map blocks deep paths, including `generic-record-ingestion/db/imports.js` and `generic-record-ingestion/dist/db/imports.js`, with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Repository helpers, SQL mutations, transaction primitives, migration discovery/ledger helpers, cursor encoders, and raw database DTOs are internal.
 
-## Commands
+## Preparation without a database
 
-```bash
-npm run typecheck
-npm test
-npm run test:integration
-npm run verify
-npm run db:migrate
-```
-
-Tests use Node's built-in test runner. Integration tests use a transactional in-memory `Queryable` harness to validate orchestration, SQL call sequencing, warning/error semantics, and rollback behavior.
-
-## End-to-end import orchestration
-
-`runRecordImport(...)` in `src/ingestion/run-record-import.ts` is the supported application-level entry point for already-decoded CSV text:
+Preparation accepts parsed string records. It does not read files or acquire a database connection, and its capacity remains caller-managed. Importing the root and using preparation does not load the CSV parser or `pg`.
 
 ```ts
-const result = await runRecordImport({
-  db,
-  importId: "import-2026-09-14-001",
+import { prepareRecordStaging, type RecordSchemaContract } from "generic-record-ingestion";
+
+const contract: RecordSchemaContract = {
+  schemaVersion: "EXAMPLE_V1",
+  requiredHeaders: ["record_id", "label"],
+};
+const prepared = prepareRecordStaging({
   contract,
-  csvText,
-  transform,
-  getRecordId,
-  diagnose,
-});
-```
-
-The orchestrator creates the `import_batch` in `RECEIVED`, parses CSV text, validates/prepares rows, persists stage rows and diagnostics transactionally, reads the committed summary, and returns `{ importId, status, summary }`.
-
-Ordinary input-quality failures are durable results rather than thrown exceptions. Malformed CSV is stored as `CSV_PARSE_ERROR`; unsupported/missing schema headers as `SCHEMA_HEADER_ERROR`; row-level diagnostics continue through persistence and can end the batch in `FAILED`. Callback and persistence failures retain the V0.5 best-effort terminalization and original-error rethrow semantics.
-
-## Filesystem adapter
-
-V0.6 adds `runRecordFileImport(...)` in `src/ingestion/run-record-file-import.ts` for a local CSV filesystem path:
-
-```ts
-const result = await runRecordFileImport({
-  db,
-  importId: "import-2026-09-14-file-001",
-  contract,
-  filePath: "/data/records.csv",
-  transform,
-  getRecordId,
-  diagnose,
-});
-```
-
-Every non-duplicate file attempt creates its durable import batch before reading the file. The adapter reads the whole file into memory, then performs strict UTF-8 decoding with fatal error handling. A missing/unreadable file or malformed UTF-8 is durably terminalized as a batch-level `FILE_READ_ERROR`, returns a normal `FAILED` result, and creates no staged rows.
-
-Once decoding succeeds, the file entry point delegates to the same post-batch CSV pipeline as `runRecordImport(...)`. Consequently malformed CSV, header/schema errors, row diagnostics, warnings, callback failures, persistence failures, duplicate IDs, and summary invariants retain the existing text-import semantics.
-
-Filesystem imports remain local-filesystem and whole-file only. They do not add streaming/chunking, upload or HTTP handling, cloud-storage adapters, directory/glob imports, file watching, retries, alternate encodings, delimiter detection, non-CSV formats, or a CLI. `Buffer`/byte data is not exposed in the public API.
-
-## V0.7 import provenance
-
-Migration `0002_add_import_provenance.sql` adds five nullable columns to `import_batch`. Existing rows retain NULL provenance. `ImportBatch` and `ImportSummary`, including summaries returned by both import entry points, expose:
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `sourceKind` | `"CSV_TEXT" \| "LOCAL_FILE" \| null` | Source category |
-| `sourceName` | `string \| null` | File basename; NULL for CSV text |
-| `sourceSizeBytes` | `number \| null` | Exact original byte count |
-| `sourceSha256` | `string \| null` | Lowercase SHA-256 hex digest |
-| `sourcePath` | `string \| null` | Reserved field; both entry points store NULL |
-
-CSV text imports UTF-8 encode the supplied string and persist complete provenance with the initial RECEIVED batch, before parsing or staging. Multibyte characters count by encoded bytes, not JavaScript string length.
-
-Filesystem imports persist LOCAL_FILE and the basename before reading. After a successful read they hash and measure the original bytes, then persist that metadata while RECEIVED, before strict UTF-8 decoding. A BOM and original line endings contribute to the checksum. Unreadable files retain partial provenance with NULL size/hash; malformed UTF-8 retains complete byte provenance. Both still use FILE_READ_ERROR.
-
-Provenance survives malformed CSV, header errors, row errors, and callback/persistence failures. An unexpected database failure while updating filesystem content metadata triggers best-effort FAILED terminalization with IMPORT_PROVENANCE_ERROR and rethrows the original exception, even if recovery also fails. Initial batch-creation failures retain existing exception behavior.
-
-`importId` remains import-attempt identity. Identical content under different IDs is accepted; SHA-256 provides diagnostic provenance only. There are no checksum lookup APIs, indexes, uniqueness constraints or deduplication.
-
-`source_size_bytes` uses PostgreSQL bigint constrained to 0 through 9007199254740991, so batch and summary values map exactly to JavaScript numbers. NULL is accepted. The database also constrains source kinds and 64-character lowercase hexadecimal digests. The supported import entry points do not store full paths in provenance; existing error-detail behavior is unchanged.
-
-## CSV adapter
-
-`src/csv/parse-csv-records.ts` exposes a focused synchronous adapter for decoded UTF-8, comma-separated CSV text. It supports standard quoted fields, commas inside quoted fields, escaped double quotes, LF/CRLF line endings, empty fields, embedded quoted newlines, and an initial UTF-8 BOM. Decoded header and field strings are preserved without trimming or type coercion.
-
-The CSV adapter owns syntax and row-width validation only. The staging layer remains authoritative for schema-contract/header validation, canonical transformation, record-ID validation, and caller-supplied diagnostics.
-
-## Database bootstrap and migrations
-
-The package owns `import_batch`, `import_stage_row`, `import_issue`, and `schema_migration`. Apply pending migrations with `npm run db:migrate`. The command uses `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE`. Migrations are forward-only, applied in lexical filename order, and recorded in `schema_migration`.
-
-## Import lifecycle/query API
-
-The service layer in `src/db/imports.ts` exposes `createImportBatch`, `failImportBatch`, `getImportBatch`, `listImportRows`, `listImportIssues`, and `getImportSummary`. `createImportBatch` accepts optional provenance fields. `updateImportSourceContentMetadata(db, { importId, sourceSizeBytes, sourceSha256 })` updates only byte size and digest, and rejects missing batches or batches outside RECEIVED. Lifecycle mutation remains narrow: `persistRecordStaging` owns `RECEIVED -> VALIDATING -> VALIDATED | FAILED`, while pre-staging terminalization supports only `RECEIVED -> FAILED`.
-
-## Live PostgreSQL verification
-
-The GitHub Actions live gate provisions PostgreSQL 18 and exercises migrations, persistence, query APIs, text orchestration, and filesystem orchestration. Provenance coverage includes migration compatibility, constraints, safe bigint mapping, duplicate content, RECEIVED-only updates, byte-preserving file metadata, malformed UTF-8, unreadable files, and database-triggered metadata failure.
-
-Run it where PostgreSQL is available:
-
-```bash
-PGHOST=127.0.0.1 \
-PGPORT=5432 \
-PGUSER=postgres \
-PGPASSWORD=postgres \
-PGDATABASE=postgres \
-npm run test:postgres
-```
-
-The included `.github/workflows/postgres-integration.yml` provisions PostgreSQL 18 as a disposable service and runs both `npm run verify` and the live PostgreSQL gate.
-# Preparation package interface
-
-The private package exposes a preparation-only root interface for callers that
-already have parsed string records. It does not read files, decode bytes, connect
-to a database, or change import/publication state.
-
-```ts
-import {
-  prepareRecordStaging,
-  RecordStagingCallbackError,
-  UnsupportedRecordSchemaError,
-  type RecordSchemaContract,
-  type StagingDiagnostic,
-  type PreparedRecord,
-  type StagingReport,
-} from "generic-record-ingestion";
-
-const result = prepareRecordStaging({
-  contract: { schemaVersion: "EXAMPLE_V1", requiredHeaders: ["record_id", "label"] },
   headers: ["record_id", "label"],
   rows: [{ record_id: "R-1", label: "  Example  " }],
   transform: row => ({ label: row.label.trim() }),
   getRecordId: row => row.record_id,
 });
-// result.rows[0].rawSourceRow.label === "  Example  "
-// result.rows[0].sourceRow.label === "Example"
+// prepared.rows[0].rawSourceRow.label === "  Example  "
+// prepared.rows[0].sourceRow.label === "Example"
 ```
 
-Header errors throw `UnsupportedRecordSchemaError`; callback failures throw
-`RecordStagingCallbackError` with the row number and original cause. ERROR
-diagnostics make `report.canProceedToPersistence` false; WARNING diagnostics do
-not. Callbacks share a working row separate from the preserved raw snapshot.
+Unknown or missing required headers throw `UnsupportedRecordSchemaError`. Callback failures throw `RecordStagingCallbackError` with the row number and original cause. `StagingDiagnostic` severity is `ERROR` or `WARNING`; only errors make `StagingReport.canProceedToPersistence` false. Callbacks share a working row separate from the raw snapshot. `PreparedRecord`, `StagingReport`, and `StagingDiagnostic` are root-exported types alongside `RecordSchemaContract`.
 
-Use `npm pack` to create a local artifact; its prepack step builds JavaScript and
-declarations. `npm run test:package` checks the real archive in an isolated ESM
-JavaScript/TypeScript consumer without installed runtime dependencies. It needs
-Node, npm, TypeScript from development dependencies, and `tar` on PATH.
-`npm run verify` includes this gate. The package remains private and retains its
-existing package version and dependency declarations; it has not been published
-to a registry. No CommonJS interface is promised.
+## Durable start with a client or pool
 
-The supported root exports are the function, two error classes and four types
-shown above. Existing deep paths are not blocked by an exports map, but are not
-the stable preparation interface. Database/file orchestration remains available
-in the repository and is not re-exported from the root. Adoption by another
-application requires its own encoding, persistence and lifecycle review.
-# Runnable synthetic inventory example
+Install the package's runtime dependencies for durable ingestion. The application owns its PostgreSQL client or pool and its lifetime. Pass the explicit `PostgresDatabase` discriminator; a `CLIENT` must be a connected dedicated client, not a pool disguised as a client. Do not share that client concurrently or call these workflows inside an application-owned transaction. A `POOL` acquires and releases one dedicated connection for each operation, including failures.
 
-From a development checkout with dependencies installed, run:
+```ts
+import pg from "pg";
+import { runMigrations, startDurableImport } from "generic-record-ingestion";
+
+const client = new pg.Client(); // pg reads the application's PG* environment
+await client.connect();
+try {
+  const database = { kind: "CLIENT" as const, client };
+  await runMigrations(database);
+  const result = await startDurableImport({
+    database,
+    importId: "example-client-001",
+    contract: { schemaVersion: "EXAMPLE_V1", requiredHeaders: ["record_id", "label"] },
+    source: { kind: "CSV_TEXT", text: "record_id,label\nR-1,Example\n" },
+    transform: row => ({ label: row.label.trim() }),
+    getRecordId: row => row.record_id,
+  });
+  console.log(result.status, result.summary);
+} finally {
+  await client.end();
+}
+```
+
+```ts
+import pg from "pg";
+import { runMigrations, startDurableImport } from "generic-record-ingestion";
+
+const pool = new pg.Pool({ max: 4 });
+try {
+  const database = { kind: "POOL" as const, pool };
+  await runMigrations(database);
+  const result = await startDurableImport({
+    database,
+    importId: "example-file-001",
+    contract: { schemaVersion: "EXAMPLE_V1", requiredHeaders: ["record_id", "label"] },
+    source: { kind: "LOCAL_FILE", filePath: "/data/records.csv" },
+    transform: row => ({ label: row.label.trim() }),
+    getRecordId: row => row.record_id,
+    diagnose: () => [],
+    limits: { maxDataRows: 10_000 },
+  });
+  console.log(result.status, result.summary.rowCount);
+} finally {
+  await pool.end();
+}
+```
+
+`DurableImportInput` uses `database` and an `ImportSource` with either CSV_TEXT `text` or LOCAL_FILE `filePath`. Start creates one `RECEIVED` attempt before source processing. Staging claims it through `VALIDATING` and commits rows, diagnostics, and the final `VALIDATED` or `FAILED` state atomically. Warnings remain nonblocking; row errors produce `FAILED`. `RunRecordImportResult` is `{ importId, status, summary }` with the committed `ImportSummary`.
+
+CSV is UTF-8, comma-separated, and supports quoted fields, escaped quotes, LF/CRLF, embedded quoted newlines, empty fields, and an initial BOM. Duplicate physical headers and inconsistent row widths are rejected. Local files use strict fatal UTF-8 decoding. Processing remains whole-file/whole-batch, without streaming, chunked persistence, alternate encodings, HTTP adapters, or source storage.
+
+## Finite limits and measured envelope
+
+| Limit | Default | Maximum |
+| --- | ---: | ---: |
+| `maxSourceBytes` | 20,074,811 | 80,298,686 |
+| `maxDataRows` | 25,000 | 100,000 |
+
+`DEFAULT_INGESTION_LIMITS` and `MAX_INGESTION_LIMITS` are frozen root constants. Omitted fields use defaults. Overrides must be positive safe integers within the maximums; zero, negative, fractional, nonfinite, and above-maximum values throw `INVALID_INGESTION_LIMIT` before an attempt is created. There is no unbounded mode. Both limits apply independently, with CSV text counted as UTF-8 bytes. Local files are checked by size before reading and by actual bytes after reading. Exceeding source or data-row bounds creates a durable failed result with no staged rows.
+
+The [operating-envelope evidence](docs/v0.8-bounded-operating-envelope.md) records synthetic parse/preparation characterization through 100,000 rows. This is not a database throughput or universal memory guarantee. Callback allocations, diagnostics, database persistence, and concurrent imports require their own capacity planning; lower application limits are supported.
+
+## Explicit recovery and provenance
+
+Use `getImportAttempt(database, importId)` to inspect a prior attempt. It returns `ImportBatch | null`; `getImportSummary` returns `ImportSummary | null`. Only `RECEIVED` can resume. `VALIDATING` is never reclaimed, and `VALIDATED` and `FAILED` are terminal. Duplicate start always throws `IMPORT_ALREADY_EXISTS`.
+
+```ts
+import { getImportAttempt, resumeDurableImport, type DurableImportInput } from "generic-record-ingestion";
+
+async function recover(input: DurableImportInput) {
+  const attempt = await getImportAttempt(input.database, input.importId);
+  if (attempt?.status === "RECEIVED") {
+    return resumeDurableImport(input);
+  }
+  return null;
+}
+```
+
+The caller must retain and resupply the source, schema contract, and callbacks. The framework stores no source artifact and performs no scheduling or automatic retry. Resume applies the same bounds and compares schema version plus every established non-null provenance field before staging. Missing provenance may be completed. A conflict throws `SOURCE_PROVENANCE_MISMATCH`; a competing resume can throw `IMPORT_NOT_RESUMABLE` even after the inspection above succeeds.
+
+`ImportSourceMetadata`, included in attempts and summaries, contains `sourceKind`, `sourceName`, `sourceSizeBytes`, `sourceSha256`, and `sourcePath`. Size and SHA-256 describe the original bytes, including BOM and line endings. File attempts retain the basename; supported entry points store no full path in `sourcePath`. Unreadable files can retain partial provenance. Legacy fields may be null. Error detail text may include underlying filesystem error information. Content checksums are diagnostic identity, not deduplication: different attempt IDs may import identical content.
+
+## Bounded pagination
+
+```ts
+import { getImportRowsPage, getImportIssuesPage, type PostgresDatabase } from "generic-record-ingestion";
+
+async function readPages(database: PostgresDatabase, importId: string) {
+  let cursor: string | undefined;
+  do {
+    const page = await getImportRowsPage(database, importId, {
+      pageSize: 100, status: "VALID", cursor,
+    });
+    console.log(page.items);
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor !== undefined);
+  return getImportIssuesPage(database, importId, { pageSize: 100, severity: "WARNING" });
+}
+```
+
+`Page<T>` contains `items` and `nextCursor`; null means the end. Sizes range from 1 to `MAX_PAGE_SIZE` (1,000), defaulting to `DEFAULT_PAGE_SIZE` (100). Row pages sort by row number; issue pages sort by row number with batch-level null rows first, then issue ID. Issue filters also support `rowNumber`. Treat cursors as opaque and retain the same attempt and filters between pages. Row and issue cursors are not interchangeable. These are position reads, not snapshot isolation across calls; prefer terminal attempts when traversing stable results.
+
+## Errors and migration reporting
+
+Expected operation/configuration failures throw the root `FrameworkError`. Branch on its `FrameworkErrorCode`-typed `code`, not its message:
+
+| Code | Meaning |
+| --- | --- |
+| `INVALID_INGESTION_LIMIT` | Invalid durable limit override |
+| `INVALID_PAGE_SIZE` | Page size outside the integer range |
+| `INVALID_CURSOR` | Malformed or wrong-kind cursor |
+| `IMPORT_ALREADY_EXISTS` | Start reused an attempt ID |
+| `IMPORT_NOT_FOUND` | Resume could not find the attempt |
+| `IMPORT_NOT_RESUMABLE` | Attempt is not RECEIVED, including a lost claim |
+| `SOURCE_PROVENANCE_MISMATCH` | Resupplied source/schema conflicts with stored identity |
+| `MIGRATION_CHECKSUM_MISMATCH` | A checksummed migration's file bytes changed |
+
+Expected source/content failures return a durable `FAILED` result: issue codes include `CSV_PARSE_ERROR`, `DUPLICATE_HEADER`, `SCHEMA_HEADER_ERROR`, `FILE_READ_ERROR`, `SOURCE_SIZE_LIMIT_EXCEEDED`, and `ROW_LIMIT_EXCEEDED`, plus row diagnostics. Durable callback failures rethrow the original cause after best-effort `STAGING_CALLBACK_ERROR` terminalization. Unexpected persistence or provenance-write failures also preserve the original exception after best-effort failure recording. Not every thrown error is a `FrameworkError`.
+
+`runMigrations(database, options?)` uses bundled SQL files by default. `RunMigrationsOptions.migrationsDir` selects an alternate directory. Migrations run forward in filename order, on one dedicated connection under an advisory lock, with each migration and its ledger entry in one transaction. Exact file bytes are SHA-256 checked before new pending migrations execute.
+
+`MigrationResult` reports `applied`, `verified`, and `legacyUnverified` filenames. A legacy ledger row with no checksum remains unverified on every run; the runner does not infer historical checksums. Review `legacyUnverified` explicitly. The package owns `import_batch`, `import_stage_row`, `import_issue`, and `schema_migration`. `npm run db:migrate` uses the normal `PG*` environment.
+
+## Verification and synthetic example
 
 ```sh
+npm run typecheck
+npm run verify
+npm run test:postgres
 npm run example:inventory
 ```
 
-The launcher packs this private library, extracts it into a temporary consumer,
-runs `examples/inventory.mjs` using the supported package-root import, and cleans
-up afterward. It needs Node, npm, and `tar` on PATH, uses no registry installation,
-and writes no database records. This is a preparation demonstration with parsed
-synthetic objects, not a CSV decoder, persistence adapter or scale benchmark.
+`npm run verify` covers unit, in-memory integration, packed JavaScript/TypeScript, and runnable-example tests. `npm run test:postgres` requires reachable PostgreSQL and `psql` on PATH; configure `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE`. The live suite includes a packed external consumer that imports only the root API, applies migrations, starts and resumes attempts, paginates rows/issues, and closes its pool. GitHub Actions provisions PostgreSQL 18 for these gates.
 
-The JSON output contains four independent scenarios:
+`npm pack` builds JavaScript and declarations. Packed tests extract the real archive into temporary consumers, with no source links or registry installation. Preparation tests intentionally have no runtime dependencies; the live packed consumer copies installed runtime dependencies. Tests need Node, npm, development TypeScript, and `tar` on PATH.
 
-| Scenario | Expected report |
-| --- | --- |
-| `clean` | No diagnostics; can proceed |
-| `warning` | One legacy-code warning; can proceed |
-| `invalidQuantity` | One invalid-quantity error; cannot proceed |
-| `duplicate` | One duplicate-ID error on the second row; cannot proceed |
-
-Compare `rawSourceRow` with `sourceRow`: whitespace and raw-only legacy codes
-remain in raw data, while canonical output contains only item name, quantity and
-warehouse. The inventory caller defines quantity normalization and its diagnostic
-rules; the library supplies missing/duplicate-ID validation and report aggregation.
-`canProceedToPersistence` describes validation, not an actual database operation.
-
-`npm run test:examples` executes the real launcher and verifies the results. It
-also runs as part of `npm run verify`. The example does not modify library
-lifecycle behavior or enable any application's production imports.
+The inventory example packs the private library and runs `examples/inventory.mjs` using the root import. It demonstrates clean, warning, invalid-quantity, and duplicate-ID preparation scenarios without database writes. Raw whitespace and legacy codes remain in raw data; canonical data contains the caller's normalized item name, quantity, and warehouse. It is not a scale benchmark.

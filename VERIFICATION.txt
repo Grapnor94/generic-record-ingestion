@@ -1,3 +1,14 @@
+Current verification status — V0.8 package boundary, 2026-09-18
+- Package root now supports preparation and durable workflows, typed reads/pages, migrations, limits, and errors. Deep package imports are blocked.
+- Package stays private at version 0.1.0; V0.8 is the implementation milestone, not a package-version or mature-semver claim.
+- npm run verify: PASS (typecheck/build, 93 unit, 113 in-memory integration, 4 packed-package, 1 runnable-example tests).
+- npm run test:postgres: PASS, 36/36 live tests, zero skipped, PostgreSQL 18.4 on Windows at 127.0.0.1:55437.
+- Packed external consumer verifies root-only migrations, client/pool start, attempt/summary reads, row/issue pagination, and explicit partial-provenance RECEIVED recovery.
+- Preparation remains usable without installed runtime dependencies; packed TypeScript consumers compile with strict checking and skipLibCheck false.
+- This entry records Task 8 local verification. Final V0.8 candidate/remote CI verification is a separate gate.
+- Earlier entries below are historical records; their environment limitations and pending statuses are not the current status.
+
+Historical verification record follows
 Generic Record Ingestion verification record
 Date: 2026-09-14 / 2026-09-15
 
