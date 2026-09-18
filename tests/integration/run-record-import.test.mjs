@@ -343,6 +343,36 @@ test("malformed CSV becomes a durable batch-level CSV_PARSE_ERROR", async () => 
   assert.equal(db.issues[0].record_id, null);
 });
 
+test("duplicate CSV headers become a durable batch-level DUPLICATE_HEADER before callbacks", async () => {
+  const db = new MemoryImportDb();
+  const csvText = "id,name,name\n1,Alice,Alias\n";
+  let transformed = false;
+  let recordIdRead = false;
+  let diagnosed = false;
+
+  const result = await runRecordImport({
+    ...baseInput(db, "import-duplicate-header"),
+    csvText,
+    transform: () => { transformed = true; return {}; },
+    getRecordId: () => { recordIdRead = true; return null; },
+    diagnose: () => { diagnosed = true; return []; },
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assert.equal(result.summary.errorCount, 1);
+  assertTextSource(db.batches.get("import-duplicate-header"), csvText);
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues.length, 1);
+  assert.equal(db.issues[0].issue_code, "DUPLICATE_HEADER");
+  assert.equal(db.issues[0].row_number, null);
+  assert.equal(db.issues[0].record_id, null);
+  assert.equal(transformed, false);
+  assert.equal(recordIdRead, false);
+  assert.equal(diagnosed, false);
+});
+
 test("unsupported schema headers become SCHEMA_HEADER_ERROR without stage rows", async () => {
   const db = new MemoryImportDb();
   const result = await runRecordImport({

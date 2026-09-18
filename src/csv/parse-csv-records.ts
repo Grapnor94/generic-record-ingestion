@@ -5,6 +5,22 @@ export type ParsedCsvRecords = {
   rows: Record<string, string>[];
 };
 
+export class DuplicateHeaderError extends Error {
+  readonly code = "DUPLICATE_HEADER";
+  readonly duplicates: readonly {
+    header: string;
+    positions: readonly number[];
+  }[];
+
+  constructor(
+    duplicates: readonly { header: string; positions: readonly number[] }[],
+  ) {
+    super("CSV parse failed: duplicate header names.");
+    this.name = "DuplicateHeaderError";
+    this.duplicates = duplicates;
+  }
+}
+
 type CsvParserError = Error & {
   code?: string;
   lines?: number;
@@ -46,6 +62,22 @@ export function parseCsvRecords(input: string): ParsedCsvRecords {
   }
 
   const headers = records[0];
+  const positionsByHeader = new Map<string, number[]>();
+  headers.forEach((header, index) => {
+    const positions = positionsByHeader.get(header);
+    if (positions) {
+      positions.push(index + 1);
+    } else {
+      positionsByHeader.set(header, [index + 1]);
+    }
+  });
+  const duplicates = [...positionsByHeader].flatMap(([header, positions]) =>
+    positions.length > 1 ? [{ header, positions }] : [],
+  );
+  if (duplicates.length > 0) {
+    throw new DuplicateHeaderError(duplicates);
+  }
+
   const rows = records.slice(1).map((record, index) => {
     if (record.length !== headers.length) {
       throw new Error(

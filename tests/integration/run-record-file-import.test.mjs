@@ -310,6 +310,36 @@ test("malformed CSV preserves CSV_PARSE_ERROR semantics", async () => withTempDi
   assert.equal(db.issues[0].issue_code, "CSV_PARSE_ERROR");
 }));
 
+test("duplicate filesystem CSV headers become DUPLICATE_HEADER before callbacks", async () => withTempDir(async (dir) => {
+  const bytes = Buffer.from("id,name,name\n1,Alice,Alias\n");
+  const filePath = await csvFile(dir, bytes);
+  const db = new MemoryImportDb();
+  let transformed = false;
+  let recordIdRead = false;
+  let diagnosed = false;
+
+  const result = await runRecordFileImport({
+    ...input(db, "file-duplicate-header", filePath),
+    transform: () => { transformed = true; return {}; },
+    getRecordId: () => { recordIdRead = true; return null; },
+    diagnose: () => { diagnosed = true; return []; },
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assert.equal(result.summary.errorCount, 1);
+  assertFileSource(db.batches.get("file-duplicate-header"), filePath, bytes);
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues.length, 1);
+  assert.equal(db.issues[0].issue_code, "DUPLICATE_HEADER");
+  assert.equal(db.issues[0].row_number, null);
+  assert.equal(db.issues[0].record_id, null);
+  assert.equal(transformed, false);
+  assert.equal(recordIdRead, false);
+  assert.equal(diagnosed, false);
+}));
+
 test("invalid headers preserve SCHEMA_HEADER_ERROR semantics", async () => withTempDir(async (dir) => {
   const filePath = await csvFile(dir, "id,unexpected\n1,Alice\n");
   const db = new MemoryImportDb();

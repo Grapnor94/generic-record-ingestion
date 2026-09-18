@@ -1,4 +1,7 @@
-import { parseCsvRecords } from "../csv/parse-csv-records.js";
+import {
+  DuplicateHeaderError,
+  parseCsvRecords,
+} from "../csv/parse-csv-records.js";
 import {
   createImportBatch,
   failImportBatch,
@@ -86,6 +89,14 @@ export async function runRecordImportAfterBatch(
   try {
     parsed = parseCsvRecords(input.csvText);
   } catch (error) {
+    if (error instanceof DuplicateHeaderError) {
+      await failImportBatch(input.db, {
+        importId: input.importId,
+        issueCode: "DUPLICATE_HEADER",
+        detail: errorDetail(error),
+      });
+      return resultFromCommittedSummary(input.db, input.importId, "FAILED");
+    }
     await failImportBatch(input.db, {
       importId: input.importId,
       issueCode: "CSV_PARSE_ERROR",

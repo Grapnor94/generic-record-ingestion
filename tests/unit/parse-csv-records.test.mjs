@@ -12,6 +12,37 @@ test("parses ordinary comma-separated rows", () => {
   });
 });
 
+test("rejects an exact duplicate physical header with one-based positions", () => {
+  assert.throws(
+    () => parseCsvRecords("Name,Name,id\nfirst,last,1\n"),
+    error => error.code === "DUPLICATE_HEADER" &&
+      assert.deepEqual(error.duplicates, [{ header: "Name", positions: [1, 2] }]) === undefined,
+  );
+});
+
+test("reports every duplicate group in first physical occurrence order", () => {
+  assert.throws(
+    () => parseCsvRecords("a,b,a,b,a\n1,2,3,4,5\n"),
+    error => error.code === "DUPLICATE_HEADER" &&
+      assert.deepEqual(error.duplicates, [
+        { header: "a", positions: [1, 3, 5] },
+        { header: "b", positions: [2, 4] },
+      ]) === undefined,
+  );
+});
+
+test("treats case and whitespace variants as distinct physical headers", () => {
+  assert.doesNotThrow(() => parseCsvRecords("Name,name,Name \n1,2,3\n"));
+});
+
+test("detects duplicate headers before considering invalid data-row widths", () => {
+  assert.throws(
+    () => parseCsvRecords("id,name,name\n1\n"),
+    error => error.code === "DUPLICATE_HEADER" &&
+      assert.deepEqual(error.duplicates, [{ header: "name", positions: [2, 3] }]) === undefined,
+  );
+});
+
 test("parses quoted commas and escaped double quotes", () => {
   assert.deepEqual(
     parseCsvRecords('id,name,note\n1,"Smith, Alice","He said ""hello"""\n'),
