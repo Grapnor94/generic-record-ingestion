@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -33,28 +33,29 @@ async function withDatabase(fn) {
 }
 
 test("provenance migration preserves legacy rows in every lifecycle state", async () => withDatabase(async db => {
-  const dir = await mkdtemp(join(tmpdir(), "provenance-migration-"));
-  try {
-    for (const filename of ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql"]) {
-      await copyFile(new URL(`../../db/migrations/${filename}`, import.meta.url), join(dir, filename));
-    }
-    await runMigrations(database(db), { migrationsDir: dir });
-    for (const status of ["RECEIVED", "VALIDATING", "VALIDATED", "FAILED"]) {
-      await db.query("insert into import_batch (import_id, schema_version, status) values ($1, 'v6', $1)", [status]);
-    }
-    const before = (await db.query("select * from import_batch order by import_id")).rows;
-    const migrated = await runMigrations(database(db));
-    assert.deepEqual(migrated.applied, ["0002_add_import_provenance.sql", "0003_add_import_query_indexes.sql"]);
-    for (const row of before) {
-      const batch = await imports.getImportBatch(db, row.import_id);
-      assert.deepEqual(source(batch), nullSource);
-      assert.deepEqual(source(await imports.getImportSummary(db, row.import_id)), nullSource);
-      assert.equal(batch.status, row.status);
-      assert.deepEqual(batch.createdAt, row.created_at);
-      assert.deepEqual(batch.updatedAt, row.updated_at);
-    }
-    assert.deepEqual((await runMigrations(database(db))).applied, []);
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  const legacy = ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql"];
+  await db.query("create table schema_migration (filename text primary key, applied_at timestamptz not null default current_timestamp)");
+  for (const filename of legacy) {
+    await db.query(await readFile(new URL(`../../db/migrations/${filename}`, import.meta.url), "utf8"));
+    await db.query("insert into schema_migration (filename) values ($1)", [filename]);
+  }
+  for (const status of ["RECEIVED", "VALIDATING", "VALIDATED", "FAILED"]) {
+    await db.query("insert into import_batch (import_id, schema_version, status) values ($1, 'v6', $1)", [status]);
+  }
+  const before = (await db.query("select * from import_batch order by import_id")).rows;
+  const migrated = await runMigrations(database(db));
+  assert.deepEqual(migrated.applied, ["0002_add_import_provenance.sql", "0003_add_import_query_indexes.sql"]);
+  assert.deepEqual(migrated.legacyUnverified, legacy);
+  assert.deepEqual(migrated.verified, []);
+  for (const row of before) {
+    const batch = await imports.getImportBatch(db, row.import_id);
+    assert.deepEqual(source(batch), nullSource);
+    assert.deepEqual(source(await imports.getImportSummary(db, row.import_id)), nullSource);
+    assert.equal(batch.status, row.status);
+    assert.deepEqual(batch.createdAt, row.created_at);
+    assert.deepEqual(batch.updatedAt, row.updated_at);
+  }
+  assert.deepEqual(await runMigrations(database(db)), { applied: [], verified: migrated.applied, legacyUnverified: legacy });
 }));
 
 test("PostgreSQL constrains kind, safe nonnegative byte size and lowercase SHA-256", async () => withDatabase(async db => {

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import pg from "pg";
@@ -61,7 +61,7 @@ const warningRow = { rowNumber: 1, recordId: "R-1", rawSourceRow: { record_id: "
 
 test("migrations bootstrap an empty PostgreSQL schema and are idempotent", async () => { await withDatabase(async (client) => {
   const filenames = ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql", "0002_add_import_provenance.sql", "0003_add_import_query_indexes.sql"];
-  const first = await runMigrations(clientDatabase(client)); assert.deepEqual(first, { applied: filenames, skipped: [] });
+  const first = await runMigrations(clientDatabase(client)); assert.deepEqual(first, { applied: filenames, verified: [], legacyUnverified: [] });
   const tables = await client.query(`select table_name from information_schema.tables where table_schema = current_schema() and table_name in ('import_batch','import_stage_row','import_issue','schema_migration') order by table_name`);
   assert.deepEqual(tables.rows.map((r) => r.table_name), ["import_batch","import_issue","import_stage_row","schema_migration"]);
   const rawColumn = await client.query(`select data_type,is_nullable from information_schema.columns where table_schema=current_schema() and table_name='import_stage_row' and column_name='raw_source_row'`);
@@ -71,8 +71,77 @@ test("migrations bootstrap an empty PostgreSQL schema and are idempotent", async
   const stageIndexes = await client.query("select indexname from pg_indexes where schemaname = current_schema() and tablename = 'import_stage_row' order by indexname");
   assert.deepEqual(stageIndexes.rows.map(row => row.indexname), ["import_stage_row_pkey"]);
   const ledger = await client.query("select filename from schema_migration order by filename"); assert.deepEqual(ledger.rows.map((r)=>r.filename), filenames);
-  const second = await runMigrations(clientDatabase(client)); assert.deepEqual(second,{applied:[],skipped:filenames});
+  const second = await runMigrations(clientDatabase(client)); assert.deepEqual(second,{applied:[],verified:filenames,legacyUnverified:[]});
 }); });
+
+test("concurrent migrators serialize ledger bootstrap and execution on dedicated sessions", async () => withDatabase(async (client, schema) => {
+  await withTempDir(async dir => {
+    const filename = "0000_slow.sql";
+    const bytes = Buffer.from("select pg_sleep(0.2);\r\ncreate table migration_once (value text); -- é\r\n");
+    await writeFile(join(dir, filename), bytes);
+    const pool = new Pool({ ...connectionConfig, max: 2, application_name: schema });
+    const database = { kind: "POOL", pool: guardedPool(pool, schema) };
+    try {
+      const results = await Promise.all([
+        runMigrations(database, { migrationsDir: dir }),
+        runMigrations(database, { migrationsDir: dir }),
+      ]);
+      assert.equal(pool.totalCount, 2);
+      assert.equal(pool.idleCount, 2);
+      assert.deepEqual(results.sort((a, b) => b.applied.length - a.applied.length), [
+        { applied: [filename], verified: [], legacyUnverified: [] },
+        { applied: [], verified: [filename], legacyUnverified: [] },
+      ]);
+      assert.deepEqual((await client.query("select filename, checksum_sha256 from schema_migration")).rows, [
+        { filename, checksum_sha256: createHash("sha256").update(bytes).digest("hex") },
+      ]);
+      assert.equal((await client.query("select count(*)::int as count from pg_locks where locktype = 'advisory' and pid in (select pid from pg_stat_activity where application_name = $1)", [schema])).rows[0].count, 0);
+    } finally { await pool.end(); }
+  });
+}));
+
+test("live checksum drift prevents earlier pending and later migrations from running", async () => withDatabase(async client => {
+  await withTempDir(async dir => {
+    await writeFile(join(dir, "0001_applied.sql"), "create table original (id int);");
+    await runMigrations(clientDatabase(client), { migrationsDir: dir });
+    await writeFile(join(dir, "0001_applied.sql"), "create table original (id bigint);");
+    await writeFile(join(dir, "0000_pending.sql"), "create table pending (id int);");
+    await writeFile(join(dir, "0002_later.sql"), "create table later (id int);");
+    await assert.rejects(() => runMigrations(clientDatabase(client), { migrationsDir: dir }), error => error instanceof FrameworkError && error.code === "MIGRATION_CHECKSUM_MISMATCH");
+    assert.deepEqual((await client.query("select filename from schema_migration")).rows, [{ filename: "0001_applied.sql" }]);
+    assert.deepEqual((await client.query("select to_regclass('pending') as pending, to_regclass('later') as later")).rows, [{ pending: null, later: null }]);
+  });
+}));
+
+test("live failed migration rolls back SQL and does not advance the checksum ledger", async () => withDatabase(async client => {
+  await withTempDir(async dir => {
+    await writeFile(join(dir, "0000_broken.sql"), "create table rolled_back (id int); select * from missing_migration_table;");
+    await assert.rejects(() => runMigrations(clientDatabase(client), { migrationsDir: dir }), error => error.code === "42P01");
+    assert.deepEqual((await client.query("select * from schema_migration")).rows, []);
+    assert.equal((await client.query("select to_regclass('rolled_back') as relation")).rows[0].relation, null);
+    await writeFile(join(dir, "0000_broken.sql"), "create table rolled_back (id int);");
+    assert.deepEqual((await runMigrations(clientDatabase(client), { migrationsDir: dir })).applied, ["0000_broken.sql"]);
+    assert.match((await client.query("select checksum_sha256 from schema_migration")).rows[0].checksum_sha256, /^[0-9a-f]{64}$/);
+  });
+}));
+
+test("legacy ledger upgrade keeps historical checksums NULL across repeated runs", async () => withDatabase(async client => {
+  const legacy = ["0000_create_core_tables.sql", "0001_add_raw_source_row.sql", "0002_add_import_provenance.sql"];
+  await client.query("create table schema_migration (filename text primary key, applied_at timestamptz not null default current_timestamp)");
+  for (const filename of legacy) {
+    await client.query(await readFile(new URL(`../../db/migrations/${filename}`, import.meta.url), "utf8"));
+    await client.query("insert into schema_migration (filename) values ($1)", [filename]);
+  }
+  const filename = "0003_add_import_query_indexes.sql";
+  assert.deepEqual(await runMigrations(clientDatabase(client)), { applied: [filename], verified: [], legacyUnverified: legacy });
+  assert.deepEqual(await runMigrations(clientDatabase(client)), { applied: [], verified: [filename], legacyUnverified: legacy });
+  const ledger = (await client.query("select filename, checksum_sha256 from schema_migration order by filename")).rows;
+  assert.deepEqual(ledger.slice(0, 3), legacy.map(filename => ({ filename, checksum_sha256: null })));
+  assert.equal(ledger[3].checksum_sha256, createHash("sha256").update(await readFile(new URL(`../../db/migrations/${filename}`, import.meta.url))).digest("hex"));
+  for (const checksum of ["A".repeat(64), "g".repeat(64), "a".repeat(63), "a".repeat(65)]) {
+    await assert.rejects(() => client.query("update schema_migration set checksum_sha256 = $1 where filename = $2", [checksum, filename]), error => error.code === "23514");
+  }
+}));
 
 test("real persistence keeps raw/canonical JSON separate and warning nonblocking", async () => { await withDatabase(async (client) => {
   await runMigrations(clientDatabase(client)); await client.query("insert into import_batch (import_id,schema_version,status) values ($1,$2,'RECEIVED')",["LIVE-1","test-v1"]);

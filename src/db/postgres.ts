@@ -50,7 +50,7 @@ export async function withDedicatedConnection<Value>(
   }
 }
 
-function retainCleanupError(primary: unknown, cleanup: unknown): void {
+export function retainCleanupError(primary: unknown, cleanup: unknown): void {
   if (
     (typeof primary !== "object" || primary === null)
     && typeof primary !== "function"
