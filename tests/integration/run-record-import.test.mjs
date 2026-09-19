@@ -211,6 +211,85 @@ test("CSV provenance is durable while RECEIVED before callbacks and counts multi
   assert.equal(result.summary.sourcePath, null);
 });
 
+test("invalid CSV ingestion limits reject before creating a batch", async () => {
+  const db = new MemoryImportDb();
+
+  await assert.rejects(
+    () => runRecordImport({
+      ...baseInput(db, "invalid-limit"),
+      limits: { maxSourceBytes: 0 },
+    }),
+    { code: "INVALID_INGESTION_LIMIT" },
+  );
+
+  assert.equal(db.batchInsertCount, 0);
+  assert.equal(db.batches.size, 0);
+});
+
+test("CSV source exactly at its UTF-8 byte limit succeeds", async () => {
+  const db = new MemoryImportDb();
+  const csvText = "id,name\n1,é😀\n";
+  const result = await runRecordImport({
+    ...baseInput(db, "source-limit-exact"),
+    csvText,
+    limits: { maxSourceBytes: 17, maxDataRows: 1 },
+  });
+
+  assert.equal(result.status, "VALIDATED");
+  assert.equal(result.summary.rowCount, 1);
+  assertTextSource(db.batches.get("source-limit-exact"), csvText);
+});
+
+test("CSV source one byte over its UTF-8 limit fails durably before callbacks", async () => {
+  const db = new MemoryImportDb();
+  const csvText = "id,name\n1,é😀\n";
+  let callbackCalls = 0;
+  const result = await runRecordImport({
+    ...baseInput(db, "source-limit-over"),
+    csvText,
+    limits: { maxSourceBytes: 16, maxDataRows: 1 },
+    transform: () => { callbackCalls += 1; return {}; },
+    getRecordId: () => { callbackCalls += 1; return null; },
+    diagnose: () => { callbackCalls += 1; return []; },
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assertTextSource(db.batches.get("source-limit-over"), csvText);
+  assert.equal(db.issues[0].issue_code, "SOURCE_SIZE_LIMIT_EXCEEDED");
+  assert.equal(db.stage.length, 0);
+  assert.equal(callbackCalls, 0);
+});
+
+test("CSV data row limit is inclusive and overflow never stages a prefix", async () => {
+  const db = new MemoryImportDb();
+  const exact = await runRecordImport({
+    ...baseInput(db, "row-limit-exact"),
+    limits: { maxDataRows: 1 },
+  });
+
+  let callbackCalls = 0;
+  const overflowCsv = "id,name\n1,Alice\n2\n";
+  const overflow = await runRecordImport({
+    ...baseInput(db, "row-limit-over"),
+    csvText: overflowCsv,
+    limits: { maxDataRows: 1 },
+    transform: () => { callbackCalls += 1; return {}; },
+    getRecordId: () => { callbackCalls += 1; return null; },
+    diagnose: () => { callbackCalls += 1; return []; },
+  });
+
+  assert.equal(exact.status, "VALIDATED");
+  assert.equal(exact.summary.rowCount, 1);
+  assert.equal(overflow.status, "FAILED");
+  assert.equal(overflow.summary.rowCount, 0);
+  assertTextSource(db.batches.get("row-limit-over"), overflowCsv);
+  assert.equal(db.issues.find((issue) => issue.import_id === "row-limit-over").issue_code, "ROW_LIMIT_EXCEEDED");
+  assert.equal(db.stage.filter((row) => row.import_id === "row-limit-over").length, 0);
+  assert.equal(callbackCalls, 0);
+});
+
 for (const [label, csvText, diagnose, code] of [
   ["parse", 'id,name\n1,"bad\n', undefined, "CSV_PARSE_ERROR"],
   ["header", "id,other\n1,Alice\n", undefined, "SCHEMA_HEADER_ERROR"],
@@ -253,7 +332,7 @@ test("identical CSV content remains accepted under different import IDs", async 
 
 function baseInput(db, importId) {
   return {
-    db,
+    db: { kind: "CLIENT", client: db },
     importId,
     contract,
     csvText: "id,name\n1,Alice\n",
@@ -261,6 +340,31 @@ function baseInput(db, importId) {
     getRecordId,
   };
 }
+
+test("pool workflow acquires and releases one dedicated connection", async () => {
+  const client = new MemoryImportDb();
+  client.releaseCalls = 0;
+  client.release = function release() { this.releaseCalls += 1; };
+  const pool = {
+    connectCalls: 0,
+    async connect() {
+      this.connectCalls += 1;
+      return client;
+    },
+    async query() {
+      throw new Error("workflow must not use pool.query");
+    },
+  };
+
+  const result = await runRecordImport({
+    ...baseInput(client, "pool-import"),
+    db: { kind: "POOL", pool },
+  });
+
+  assert.equal(result.status, "VALIDATED");
+  assert.equal(pool.connectCalls, 1);
+  assert.equal(client.releaseCalls, 1);
+});
 
 test("runRecordImport persists a valid CSV import and returns the committed summary", async () => {
   const db = new MemoryImportDb();
@@ -316,6 +420,37 @@ test("malformed CSV becomes a durable batch-level CSV_PARSE_ERROR", async () => 
   assert.equal(db.issues[0].issue_code, "CSV_PARSE_ERROR");
   assert.equal(db.issues[0].row_number, null);
   assert.equal(db.issues[0].record_id, null);
+});
+
+test("duplicate CSV headers become a durable batch-level DUPLICATE_HEADER before callbacks", async () => {
+  const db = new MemoryImportDb();
+  const csvText = "id,name,name\n1,Alice,Alias\n2,Bob,Robert\n";
+  let transformed = false;
+  let recordIdRead = false;
+  let diagnosed = false;
+
+  const result = await runRecordImport({
+    ...baseInput(db, "import-duplicate-header"),
+    csvText,
+    limits: { maxDataRows: 1 },
+    transform: () => { transformed = true; return {}; },
+    getRecordId: () => { recordIdRead = true; return null; },
+    diagnose: () => { diagnosed = true; return []; },
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assert.equal(result.summary.errorCount, 1);
+  assertTextSource(db.batches.get("import-duplicate-header"), csvText);
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues.length, 1);
+  assert.equal(db.issues[0].issue_code, "DUPLICATE_HEADER");
+  assert.equal(db.issues[0].row_number, null);
+  assert.equal(db.issues[0].record_id, null);
+  assert.equal(transformed, false);
+  assert.equal(recordIdRead, false);
+  assert.equal(diagnosed, false);
 });
 
 test("unsupported schema headers become SCHEMA_HEADER_ERROR without stage rows", async () => {

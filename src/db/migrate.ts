@@ -14,12 +14,15 @@ const client = new Client({
 async function main(): Promise<void> {
   await client.connect();
   try {
-    const result = await runMigrations(client);
+    const result = await runMigrations({ kind: "CLIENT", client });
     for (const filename of result.applied) {
       console.log(`applied ${filename}`);
     }
-    for (const filename of result.skipped) {
-      console.log(`skipped ${filename}`);
+    for (const filename of result.verified) {
+      console.log(`verified ${filename}`);
+    }
+    for (const filename of result.legacyUnverified) {
+      console.log(`legacyUnverified ${filename}`);
     }
   } finally {
     await client.end();

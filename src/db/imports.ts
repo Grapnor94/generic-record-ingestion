@@ -1,4 +1,16 @@
-import type { Queryable } from "../ingestion/persist-record-staging.js";
+import { FrameworkError } from "../errors.js";
+import {
+  withTransaction,
+  type PostgresQueryable,
+} from "./postgres.js";
+import {
+  decodeIssueCursor,
+  decodeRowCursor,
+  encodeIssueCursor,
+  encodeRowCursor,
+  validatePageSize,
+  type Page,
+} from "./pagination.js";
 
 export type ImportBatchStatus = "RECEIVED" | "VALIDATING" | "VALIDATED" | "FAILED";
 
@@ -42,6 +54,19 @@ export type ImportIssue = {
   severity: ImportIssueSeverity;
   fieldKey: string | null;
   detail: string;
+};
+
+export type ImportRowsPageOptions = {
+  pageSize?: number;
+  cursor?: string;
+  status?: ImportRowStatus;
+};
+
+export type ImportIssuesPageOptions = {
+  pageSize?: number;
+  cursor?: string;
+  severity?: ImportIssueSeverity;
+  rowNumber?: number;
 };
 
 export type ImportSummary = ImportSourceMetadata & {
@@ -169,7 +194,7 @@ function isPostgresUniqueViolation(error: unknown): boolean {
 }
 
 export async function createImportBatch(
-  db: Queryable,
+  db: PostgresQueryable,
   input: { importId: string; schemaVersion: string } & Partial<ImportSourceMetadata>,
 ): Promise<ImportBatch> {
   try {
@@ -185,19 +210,19 @@ export async function createImportBatch(
     return mapImportBatch(result.rows[0]);
   } catch (error) {
     if (isPostgresUniqueViolation(error)) {
-      throw new Error(`Import batch already exists: ${input.importId}`);
+      throw new FrameworkError("IMPORT_ALREADY_EXISTS", `Import batch already exists: ${input.importId}`, { cause: error });
     }
     throw error;
   }
 }
 
 export async function updateImportSourceContentMetadata(
-  db: Queryable,
+  db: PostgresQueryable,
   input: { importId: string; sourceSizeBytes: number; sourceSha256: string },
 ): Promise<void> {
   const result = await db.query(
     `update import_batch
-     set source_size_bytes = $2, source_sha256 = $3
+     set source_size_bytes = $2, source_sha256 = $3, updated_at = clock_timestamp()
      where import_id = $1 and status = 'RECEIVED'
      returning import_id`,
     [input.importId, input.sourceSizeBytes, input.sourceSha256],
@@ -208,35 +233,55 @@ export async function updateImportSourceContentMetadata(
 }
 
 export async function failImportBatch(
-  db: Queryable,
+  db: PostgresQueryable,
   input: { importId: string; issueCode: string; detail: string },
 ): Promise<void> {
-  await db.query("begin");
-  try {
-    const transition = await db.query(
+  await withTransaction(db, async (transaction) => {
+    const transition = await transaction.query(
       `update import_batch
-       set status = 'FAILED'
+       set status = 'FAILED', updated_at = clock_timestamp()
        where import_id = $1 and status = 'RECEIVED'
        returning import_id`,
       [input.importId],
     );
     if (transition.rowCount !== 1) {
-      throw new Error("Import must be in RECEIVED status before failure terminalization.");
+      throw new FrameworkError("IMPORT_NOT_RESUMABLE", "Import must be in RECEIVED status before failure terminalization.");
     }
-    await db.query(
+    await transaction.query(
       `insert into import_issue
          (import_id, row_number, record_id, issue_code, severity, field_key, detail)
        values ($1, null, null, $2, 'ERROR', null, $3)`,
       [input.importId, input.issueCode, input.detail],
     );
-    await db.query("commit");
-  } catch (error) {
-    await db.query("rollback");
-    throw error;
-  }
+  });
 }
 
-export async function getImportBatch(db: Queryable, importId: string): Promise<ImportBatch | null> {
+/** @internal Terminalize a resume attempt after it has exclusively claimed VALIDATING. */
+export async function failClaimedImportBatch(
+  db: PostgresQueryable,
+  input: { importId: string; issueCode: string; detail: string },
+): Promise<void> {
+  await withTransaction(db, async (transaction) => {
+    const transition = await transaction.query(
+      `update import_batch
+       set status = 'FAILED', updated_at = clock_timestamp()
+       where import_id = $1 and status = 'VALIDATING'
+       returning import_id`,
+      [input.importId],
+    );
+    if (transition.rowCount !== 1) {
+      throw new FrameworkError("IMPORT_NOT_RESUMABLE", "Claimed import must be in VALIDATING status before failure terminalization.");
+    }
+    await transaction.query(
+      `insert into import_issue
+         (import_id, row_number, record_id, issue_code, severity, field_key, detail)
+       values ($1, null, null, $2, 'ERROR', null, $3)`,
+      [input.importId, input.issueCode, input.detail],
+    );
+  });
+}
+
+export async function getImportBatch(db: PostgresQueryable, importId: string): Promise<ImportBatch | null> {
   const result = await db.query<BatchRow>(
     `select import_id, schema_version, status, created_at, updated_at,
        source_kind, source_name, source_size_bytes, source_sha256, source_path
@@ -248,7 +293,7 @@ export async function getImportBatch(db: Queryable, importId: string): Promise<I
 }
 
 export async function listImportRows(
-  db: Queryable,
+  db: PostgresQueryable,
   importId: string,
   options?: { status?: ImportRowStatus },
 ): Promise<ImportRow[]> {
@@ -269,7 +314,7 @@ export async function listImportRows(
 }
 
 export async function listImportIssues(
-  db: Queryable,
+  db: PostgresQueryable,
   importId: string,
   options?: { severity?: ImportIssueSeverity; rowNumber?: number },
 ): Promise<ImportIssue[]> {
@@ -294,7 +339,95 @@ export async function listImportIssues(
   return result.rows.map(mapImportIssue);
 }
 
-export async function getImportSummary(db: Queryable, importId: string): Promise<ImportSummary | null> {
+export async function listImportRowsPage(
+  db: PostgresQueryable,
+  importId: string,
+  options: ImportRowsPageOptions = {},
+): Promise<Page<ImportRow>> {
+  const pageSize = validatePageSize(options.pageSize);
+  const cursor = options.cursor === undefined ? undefined : decodeRowCursor(options.cursor);
+  const values: unknown[] = [importId];
+  const filters: string[] = [];
+  if (options.status !== undefined) {
+    values.push(options.status);
+    filters.push(`validation_status = $${values.length}`);
+  }
+  if (cursor !== undefined) {
+    values.push(cursor.rowNumber);
+    filters.push(`row_number > $${values.length}`);
+  }
+  values.push(pageSize + 1);
+  const suffix = filters.length === 0 ? "" : ` and ${filters.join(" and ")}`;
+  const result = await db.query<StageRow>(
+    `select import_id, row_number, record_id, source_row, raw_source_row, validation_status
+     from import_stage_row
+     where import_id = $1${suffix}
+     order by row_number asc
+     limit $${values.length}`,
+    values,
+  );
+  const hasNextPage = result.rows.length > pageSize;
+  const items = result.rows.slice(0, pageSize).map(mapImportRow);
+  return {
+    items,
+    nextCursor: hasNextPage ? encodeRowCursor(items[items.length - 1].rowNumber) : null,
+  };
+}
+
+export async function listImportIssuesPage(
+  db: PostgresQueryable,
+  importId: string,
+  options: ImportIssuesPageOptions = {},
+): Promise<Page<ImportIssue>> {
+  const pageSize = validatePageSize(options.pageSize);
+  const cursor = options.cursor === undefined ? undefined : decodeIssueCursor(options.cursor);
+  const values: unknown[] = [importId];
+  const filters: string[] = [];
+  if (options.severity !== undefined) {
+    values.push(options.severity);
+    filters.push(`severity = $${values.length}`);
+  }
+  if (options.rowNumber !== undefined) {
+    values.push(options.rowNumber);
+    filters.push(`row_number = $${values.length}`);
+  }
+  if (cursor !== undefined) {
+    values.push(cursor.rowNumber);
+    const cursorRowNumberParameter = `$${values.length}`;
+    values.push(cursor.issueId);
+    const cursorIssueIdParameter = `$${values.length}`;
+    filters.push(
+      `(
+        (${cursorRowNumberParameter}::bigint is null and
+          ((row_number is null and issue_id > ${cursorIssueIdParameter}) or row_number is not null))
+        or
+        (${cursorRowNumberParameter}::bigint is not null and
+          (row_number > ${cursorRowNumberParameter} or
+            (row_number = ${cursorRowNumberParameter} and issue_id > ${cursorIssueIdParameter})))
+      )`,
+    );
+  }
+  values.push(pageSize + 1);
+  const suffix = filters.length === 0 ? "" : ` and ${filters.join(" and ")}`;
+  const result = await db.query<IssueRow>(
+    `select issue_id, import_id, row_number, record_id, issue_code, severity, field_key, detail
+     from import_issue
+     where import_id = $1${suffix}
+     order by row_number asc nulls first, issue_id asc
+     limit $${values.length}`,
+    values,
+  );
+  const hasNextPage = result.rows.length > pageSize;
+  const items = result.rows.slice(0, pageSize).map(mapImportIssue);
+  return {
+    items,
+    nextCursor: hasNextPage
+      ? encodeIssueCursor(items[items.length - 1].rowNumber, items[items.length - 1].issueId)
+      : null,
+  };
+}
+
+export async function getImportSummary(db: PostgresQueryable, importId: string): Promise<ImportSummary | null> {
   const result = await db.query<SummaryRow>(
     `select
        b.import_id,
@@ -332,4 +465,38 @@ export async function getImportSummary(db: Queryable, importId: string): Promise
     [importId],
   );
   return result.rows[0] ? mapImportSummary(result.rows[0]) : null;
+}
+
+
+/** @internal Compare only fields for which the attempt already has an identity. */
+export function assertImportProvenance(existing: ImportBatch, supplied: Partial<ImportSourceMetadata> & { schemaVersion?: string }): void {
+  for (const field of ["schemaVersion", "sourceKind", "sourceName", "sourceSizeBytes", "sourceSha256", "sourcePath"] as const) {
+    if (field in supplied && existing[field] !== null && existing[field] !== supplied[field]) {
+      throw new FrameworkError("SOURCE_PROVENANCE_MISMATCH", `Source provenance mismatch: ${field}`, { details: { field } });
+    }
+  }
+}
+
+/** @internal Fill missing identity and exclusively claim this RECEIVED attempt for resume. */
+export async function completeImportSourceMetadata(db: PostgresQueryable, input: { importId: string; schemaVersion: string } & ImportSourceMetadata): Promise<void> {
+  const result = await db.query(
+    `update import_batch
+     set status = 'VALIDATING',
+         source_kind = coalesce(source_kind, $3), source_name = coalesce(source_name, $4),
+         source_size_bytes = coalesce(source_size_bytes, $5), source_sha256 = coalesce(source_sha256, $6),
+         updated_at = clock_timestamp()
+     where import_id = $1 and status = 'RECEIVED' and schema_version = $2
+       and (source_kind is null or source_kind = $3)
+       and (source_name is null or source_name = $4)
+       and (source_size_bytes is null or source_size_bytes = $5)
+       and (source_sha256 is null or source_sha256 = $6)
+       and (source_path is null or source_path = $7)
+     returning import_id`,
+    [input.importId, input.schemaVersion, input.sourceKind, input.sourceName, input.sourceSizeBytes, input.sourceSha256, input.sourcePath],
+  );
+  if (result.rowCount !== 1) {
+    const current = await getImportBatch(db, input.importId);
+    if (current && current.status === "RECEIVED") assertImportProvenance(current, input);
+    throw new FrameworkError("IMPORT_NOT_RESUMABLE", "Import must be in RECEIVED status before resume.");
+  }
 }

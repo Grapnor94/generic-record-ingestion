@@ -1,3 +1,56 @@
+V0.8 release-candidate verification record — 2026-09-18
+
+Candidate identity and environment
+- Branch: feature/v0.8-production-hardening.
+- Verified implementation HEAD before this evidence-only commit: 5ca8afe2b38bfeeeb52c8b404a857af87f0fb4af.
+- The exact candidate is the commit containing this record. Its SHA and the required committed-HEAD rerun/remote CI result are recorded in the Task 9 implementation report because a commit cannot contain its own SHA.
+- Windows 10.0.19045 x64; Node.js v24.19.0; npm 12.0.2; TypeScript 5.9.3.
+- PostgreSQL server 18.4 at 127.0.0.1:55437; bundled psql client 18.0.
+- Repository was clean before the focused gates. Generated characterization output is ignored and was not added to the candidate.
+
+Focused and complete gates
+- npm run typecheck: PASS.
+- npm run build: PASS.
+- node --test tests/unit/*.test.mjs: PASS, 93/93; zero failed, skipped, cancelled, or todo.
+- node --test tests/integration/*.test.mjs: PASS, 113/113; zero failed, skipped, cancelled, or todo.
+- node --test tests/package/*.test.mjs: PASS, 4/4; zero failed, skipped, cancelled, or todo.
+- node --test tests/examples/*.test.mjs: PASS, 1/1; zero failed, skipped, cancelled, or todo.
+- npm run characterize:bounded: PASS, 8/8 scenarios through 100,000 rows.
+- npm run test:postgres: PASS, 36/36 live tests; zero failed, skipped, cancelled, or todo.
+- npm run verify && npm run test:postgres: PASS before the evidence commit with the same exact counts: 93 unit, 113 in-memory integration, 4 packed-package, 1 runnable-example, and 36 live PostgreSQL tests.
+- npm pack --dry-run: PASS after prepack/build; 46 files, 19.8 kB packed, 77.6 kB unpacked. Package stays private at version 0.1.0.
+- The first direct package-only invocation could not resolve npm/bin/npm-cli.js from the external toolchain wrapper, and the first dry-run pack could not write npm's default AppData cache under the sandbox. Setting npm_execpath to the installed npm 12.0.2 CLI and redirecting npm's cache to the writable task temp area made the exact gates pass; no repository or runtime change was made.
+
+Bounded-ingestion characterization
+- All narrow and moderately-wide shapes passed at 10,000, 25,000, 50,000, and 100,000 rows. No scenario timed out or returned incomplete parsed/prepared counts.
+- 10,000 rows: narrow 439,858 source bytes / 78,618,624 peak RSS; moderately-wide 8,030,036 bytes / 216,518,656 peak RSS.
+- 25,000 rows: narrow 1,099,633 source bytes / 92,672,000 peak RSS; moderately-wide 20,074,811 bytes / 338,587,648 peak RSS.
+- 50,000 rows: narrow 2,199,258 source bytes / 131,194,880 peak RSS; moderately-wide 40,149,436 bytes / 507,568,128 peak RSS.
+- 100,000 rows: narrow 4,398,508 source bytes / 205,586,432 peak RSS; moderately-wide 80,298,686 bytes / 822,484,992 peak RSS.
+- Selected finite defaults remain maxSourceBytes=20,074,811 and maxDataRows=25,000. Maximums remain maxSourceBytes=80,298,686 and maxDataRows=100,000. Pagination remains default 100 and maximum 1,000.
+- These synthetic parse/preparation measurements are a bounded operating envelope, not database-throughput or universal-memory guarantees.
+
+Migrations and checksum behavior
+- Ordered migration set: 0000_create_core_tables.sql, 0001_add_raw_source_row.sql, 0002_add_import_provenance.sql, 0003_add_import_query_indexes.sql. Only 0003 is introduced by V0.8.
+- Exact SHA-256 values: 0000 d0b393ec5b01e657e3988c5394e9663c82e2be7336c5b0e5c9aaf9e6d98d0386; 0001 421718685278adb019538d7ea0e575fbd8f70a2b52e622aa220f25dcb8ee7d3b; 0002 b9edca743daf1f996d650782f92b79df1aa40787832106c73da7a14e85377873; 0003 49fd712666043d44866d6cab566916c6168a3517e7ebd082a8e99ed0ebbd5147.
+- A dedicated session advisory lock serializes ledger bootstrap, discovery, checksum preflight, and application. New migrations store exact-byte lowercase SHA-256 values; checksummed rows are verified before any pending migration executes. Existing legacy rows keep NULL checksums and are reported as legacyUnverified rather than silently backfilled. Migration SQL and its ledger insert share one transaction.
+- Live coverage passed for empty-schema bootstrap/idempotency, concurrent migrators, drift preflight, failed-migration rollback, legacy ledger upgrade, and exact packed-root migration use.
+
+Supported root package API
+- Runtime values (15): DEFAULT_INGESTION_LIMITS, DEFAULT_PAGE_SIZE, FrameworkError, MAX_INGESTION_LIMITS, MAX_PAGE_SIZE, RecordStagingCallbackError, UnsupportedRecordSchemaError, getImportAttempt, getImportIssuesPage, getImportRowsPage, getImportSummary, prepareRecordStaging, resumeDurableImport, runMigrations, startDurableImport.
+- Type-only exports (26): RecordSchemaContract, StagingDiagnostic, PreparedRecord, StagingReport, ImportSource, DurableImportInput, RunRecordImportResult, IngestionLimits, FrameworkErrorCode, PostgresDatabase, PostgresQueryable, PostgresPoolClient, ImportBatch, ImportBatchStatus, ImportSourceKind, ImportSourceMetadata, ImportSummary, ImportRow, ImportRowStatus, ImportIssue, ImportIssueSeverity, ImportRowsPageOptions, ImportIssuesPageOptions, Page, RunMigrationsOptions, MigrationResult.
+- Packed external consumers verify the exact runtime surface, blocked deep imports, preparation without installed runtime dependencies, strict TypeScript declarations with skipLibCheck false, client/pool durable starts, attempt/summary reads, bounded row/issue pages, migrations, and partial-provenance RECEIVED recovery.
+
+Scope evidence
+- Diff from f0f904f9136417131e0e573385922b4753dc2d8a contains 41 files, 4,106 insertions, and 700 deletions. Every file maps to the approved B–G workstreams, verification, examples, documentation, or packaging.
+- The exact domain scan over src, tests, examples, and db found no Arkansas, voter, SOS, election, precinct, district, or party matches.
+- No credential, temporary database artifact, generated characterization output, unrelated refactor, streaming/chunking, source storage, workers, user-facing history/search, domain semantics, schema registry, alternate encoding, telemetry, deduplication, full-path persistence, or downgrade/branching migration support is included.
+- .github is unchanged; local approved gates did not justify a CI workflow edit.
+- This evidence returns a release candidate for a separate authoritative-DOCX closure audit. It does not merge the branch or declare V0.8 complete.
+
+- Earlier entries below are historical records; their environment limitations and pending statuses are not the current status.
+
+Historical verification record follows
 Generic Record Ingestion verification record
 Date: 2026-09-14 / 2026-09-15
 

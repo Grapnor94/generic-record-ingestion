@@ -4,119 +4,12 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
-import { runRecordFileImport } from "../../dist/ingestion/run-record-file-import.js";
+import {
+  runRecordFileImport,
+  runRecordFileImportWithFileOperationsForTest,
+} from "../../dist/ingestion/run-record-file-import.js";
 
-class MemoryImportDb {
-  constructor() {
-    this.batches = new Map();
-    this.stage = [];
-    this.issues = [];
-    this.snapshot = null;
-    this.nextIssueId = 1;
-    this.stageInsertError = null;
-    this.batchIssueError = null;
-  }
-
-  clone() {
-    return {
-      batches: new Map([...this.batches].map(([key, value]) => [key, { ...value }])),
-      stage: structuredClone(this.stage),
-      issues: structuredClone(this.issues),
-      nextIssueId: this.nextIssueId,
-    };
-  }
-
-  async query(sql, values = []) {
-    const q = sql.replace(/\s+/g, " ").trim().toLowerCase();
-    if (q === "begin") {
-      this.snapshot = this.clone();
-      return { rowCount: null, rows: [] };
-    }
-    if (q === "commit") {
-      this.snapshot = null;
-      return { rowCount: null, rows: [] };
-    }
-    if (q === "rollback") {
-      if (this.snapshot) {
-        this.batches = this.snapshot.batches;
-        this.stage = this.snapshot.stage;
-        this.issues = this.snapshot.issues;
-        this.nextIssueId = this.snapshot.nextIssueId;
-      }
-      this.snapshot = null;
-      return { rowCount: null, rows: [] };
-    }
-    if (q.startsWith("insert into import_batch")) {
-      const [importId, schemaVersion, source_kind, source_name, source_size_bytes, source_sha256, source_path] = values;
-      if (this.batches.has(importId)) throw Object.assign(new Error("duplicate"), { code: "23505" });
-      const row = { source_kind, source_name, source_size_bytes, source_sha256, source_path, import_id: importId, schema_version: schemaVersion, status: "RECEIVED", created_at: new Date(), updated_at: new Date() };
-      this.batches.set(importId, { ...row });
-      return { rowCount: 1, rows: [row] };
-    }
-    if (q.startsWith("update import_batch") && q.includes("set source_size_bytes")) {
-      const batch = this.batches.get(values[0]);
-      if (!batch || batch.status !== "RECEIVED") return { rowCount: 0, rows: [] };
-      batch.source_size_bytes = values[1];
-      batch.source_sha256 = values[2];
-      return { rowCount: 1, rows: [{ import_id: values[0] }] };
-    }
-    if (q.startsWith("update import_batch") && q.includes("set status = 'failed'") && q.includes("status = 'received'")) {
-      const batch = this.batches.get(values[0]);
-      if (!batch || batch.status !== "RECEIVED") return { rowCount: 0, rows: [] };
-      batch.status = "FAILED";
-      return { rowCount: 1, rows: [{ import_id: values[0] }] };
-    }
-    if (q.startsWith("update import_batch") && q.includes("validating")) {
-      const batch = this.batches.get(values[0]);
-      if (!batch || batch.status !== "RECEIVED") return { rowCount: 0, rows: [] };
-      batch.status = "VALIDATING";
-      return { rowCount: 1, rows: [{ import_id: values[0] }] };
-    }
-    if (q.startsWith("insert into import_stage_row")) {
-      if (this.stageInsertError) throw this.stageInsertError;
-      const [importId, rowNumber, recordId, sourceJson, rawJson] = values;
-      this.stage.push({ import_id: importId, row_number: rowNumber, record_id: recordId, source_row: JSON.parse(sourceJson), raw_source_row: rawJson === null ? null : JSON.parse(rawJson), validation_status: "PENDING" });
-      return { rowCount: 1, rows: [] };
-    }
-    if (q.startsWith("insert into import_issue")) {
-      if (values.length === 3) {
-        if (this.batchIssueError) throw this.batchIssueError;
-        const [importId, issueCode, detail] = values;
-        this.issues.push({ issue_id: this.nextIssueId++, import_id: importId, row_number: null, record_id: null, issue_code: issueCode, severity: "ERROR", field_key: null, detail });
-      } else {
-        const [importId, rowNumber, recordId, issueCode, severity, fieldKey, detail] = values;
-        this.issues.push({ issue_id: this.nextIssueId++, import_id: importId, row_number: rowNumber, record_id: recordId, issue_code: issueCode, severity, field_key: fieldKey, detail });
-      }
-      return { rowCount: 1, rows: [] };
-    }
-    if (q.startsWith("update import_stage_row")) {
-      const [importId, invalidRows] = values;
-      let count = 0;
-      for (const row of this.stage) {
-        if (row.import_id === importId) {
-          row.validation_status = invalidRows.includes(row.row_number) ? "INVALID" : "VALID";
-          count += 1;
-        }
-      }
-      return { rowCount: count, rows: [] };
-    }
-    if (q.startsWith("update import_batch set status")) {
-      const batch = this.batches.get(values[0]);
-      if (!batch) return { rowCount: 0, rows: [] };
-      batch.status = values[1];
-      return { rowCount: 1, rows: [] };
-    }
-    if (q.startsWith("select") && q.includes("from import_batch b") && q.includes("left join lateral")) {
-      const importId = values[0];
-      const batch = this.batches.get(importId);
-      if (!batch) return { rowCount: 0, rows: [] };
-      const rows = this.stage.filter((row) => row.import_id === importId);
-      const issues = this.issues.filter((issue) => issue.import_id === importId);
-      return { rowCount: 1, rows: [{ ...batch, import_id: importId, schema_version: batch.schema_version, status: batch.status, row_count: rows.length, valid_row_count: rows.filter((r) => r.validation_status === "VALID").length, invalid_row_count: rows.filter((r) => r.validation_status === "INVALID").length, pending_row_count: rows.filter((r) => r.validation_status === "PENDING").length, error_count: issues.filter((i) => i.severity === "ERROR").length, warning_count: issues.filter((i) => i.severity === "WARNING").length }] };
-    }
-    throw new Error(`Unsupported SQL: ${q}`);
-  }
-}
+import { MemoryImportDb } from "../support/memory-import-db.mjs";
 
 const contract = { schemaVersion: "v1", requiredHeaders: ["id", "name"] };
 const transform = (row) => ({ name: row.name });
@@ -134,7 +27,14 @@ async function csvFile(dir, contents, name = "records.csv") {
 }
 
 function input(db, importId, filePath) {
-  return { db, importId, contract, filePath, transform, getRecordId };
+  return {
+    db: { kind: "CLIENT", client: db },
+    importId,
+    contract,
+    filePath,
+    transform,
+    getRecordId,
+  };
 }
 
 function assertFileSource(batch, filePath, bytes = null) {
@@ -178,6 +78,86 @@ test("filesystem provenance is partial before read and complete while RECEIVED b
   assert.equal(result.summary.sourcePath, null);
   assert.equal(result.summary.sourceSizeBytes, bytes.length);
   assert.equal(result.summary.sourceSha256, db.batches.get("timing").source_sha256);
+}));
+
+test("file metadata over the source limit prevents reading and retains partial provenance", async () => withTempDir(async dir => {
+  const db = new MemoryImportDb();
+  const filePath = join(dir, "metadata-too-large.csv");
+  let readCalls = 0;
+  const result = await runRecordFileImportWithFileOperationsForTest(
+    {
+      ...input(db, "metadata-too-large", filePath),
+      limits: { maxSourceBytes: 16 },
+    },
+    {
+      stat: async () => ({ size: 17 }),
+      readFile: async () => { readCalls += 1; return Buffer.from("unreachable"); },
+    },
+  );
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assertFileSource(db.batches.get("metadata-too-large"), filePath);
+  assert.equal(db.issues[0].issue_code, "SOURCE_SIZE_LIMIT_EXCEEDED");
+  assert.equal(db.stage.length, 0);
+  assert.equal(readCalls, 0);
+}));
+
+test("file growth after stat records exact provenance and fails before decoding", async () => withTempDir(async dir => {
+  const db = new MemoryImportDb();
+  const filePath = join(dir, "grew.csv");
+  const bytes = Buffer.from([0xff, 0xff]);
+  const result = await runRecordFileImportWithFileOperationsForTest(
+    {
+      ...input(db, "file-grew", filePath),
+      limits: { maxSourceBytes: 1 },
+    },
+    {
+      stat: async () => ({ size: 1 }),
+      readFile: async () => bytes,
+    },
+  );
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assertFileSource(db.batches.get("file-grew"), filePath, bytes);
+  assert.equal(db.issues[0].issue_code, "SOURCE_SIZE_LIMIT_EXCEEDED");
+  assert.equal(db.stage.length, 0);
+}));
+
+test("file source exactly at its byte limit succeeds", async () => withTempDir(async dir => {
+  const bytes = Buffer.from("id,name\n1,Alice\n", "utf8");
+  const filePath = await csvFile(dir, bytes);
+  const db = new MemoryImportDb();
+  const result = await runRecordFileImport({
+    ...input(db, "file-limit-exact", filePath),
+    limits: { maxSourceBytes: bytes.length, maxDataRows: 1 },
+  });
+
+  assert.equal(result.status, "VALIDATED");
+  assert.equal(result.summary.rowCount, 1);
+  assertFileSource(db.batches.get("file-limit-exact"), filePath, bytes);
+}));
+
+test("file row overflow is durable and never stages a prefix", async () => withTempDir(async dir => {
+  const bytes = Buffer.from("id,name\n1,Alice\n2,Bob\n", "utf8");
+  const filePath = await csvFile(dir, bytes);
+  const db = new MemoryImportDb();
+  let callbackCalls = 0;
+  const result = await runRecordFileImport({
+    ...input(db, "file-row-limit", filePath),
+    limits: { maxDataRows: 1 },
+    transform: () => { callbackCalls += 1; return {}; },
+    getRecordId: () => { callbackCalls += 1; return null; },
+    diagnose: () => { callbackCalls += 1; return []; },
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assertFileSource(db.batches.get("file-row-limit"), filePath, bytes);
+  assert.equal(db.issues[0].issue_code, "ROW_LIMIT_EXCEEDED");
+  assert.equal(db.stage.length, 0);
+  assert.equal(callbackCalls, 0);
 }));
 
 test("unreadable filesystem import retains partial provenance and FILE_READ_ERROR", async () => withTempDir(async dir => {
@@ -284,12 +264,17 @@ test("missing file becomes durable FILE_READ_ERROR with no staged rows", async (
 
 test("malformed UTF-8 becomes durable FILE_READ_ERROR with no staged rows", async () => withTempDir(async (dir) => {
   const filePath = join(dir, "invalid.csv");
-  await writeFile(filePath, Buffer.from([0x69, 0x64, 0x2c, 0x6e, 0x61, 0x6d, 0x65, 0x0a, 0x31, 0x2c, 0xc3, 0x28]));
+  const bytes = Buffer.from([0x69, 0x64, 0x2c, 0x6e, 0x61, 0x6d, 0x65, 0x0a, 0x31, 0x2c, 0xc3, 0x28]);
+  await writeFile(filePath, bytes);
   const db = new MemoryImportDb();
-  const result = await runRecordFileImport(input(db, "file-invalid-utf8", filePath));
+  const result = await runRecordFileImport({
+    ...input(db, "file-invalid-utf8", filePath),
+    limits: { maxSourceBytes: bytes.length },
+  });
   assert.equal(result.status, "FAILED");
   assert.equal(result.summary.errorCount, 1);
   assert.equal(db.stage.length, 0);
+  assertFileSource(db.batches.get("file-invalid-utf8"), filePath, bytes);
   assert.equal(db.issues[0].issue_code, "FILE_READ_ERROR");
 }));
 
@@ -301,6 +286,36 @@ test("malformed CSV preserves CSV_PARSE_ERROR semantics", async () => withTempDi
   assert.equal(result.summary.rowCount, 0);
   assert.equal(db.stage.length, 0);
   assert.equal(db.issues[0].issue_code, "CSV_PARSE_ERROR");
+}));
+
+test("duplicate filesystem CSV headers become DUPLICATE_HEADER before callbacks", async () => withTempDir(async (dir) => {
+  const bytes = Buffer.from("id,name,name\n1,Alice,Alias\n");
+  const filePath = await csvFile(dir, bytes);
+  const db = new MemoryImportDb();
+  let transformed = false;
+  let recordIdRead = false;
+  let diagnosed = false;
+
+  const result = await runRecordFileImport({
+    ...input(db, "file-duplicate-header", filePath),
+    transform: () => { transformed = true; return {}; },
+    getRecordId: () => { recordIdRead = true; return null; },
+    diagnose: () => { diagnosed = true; return []; },
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.summary.status, "FAILED");
+  assert.equal(result.summary.rowCount, 0);
+  assert.equal(result.summary.errorCount, 1);
+  assertFileSource(db.batches.get("file-duplicate-header"), filePath, bytes);
+  assert.equal(db.stage.length, 0);
+  assert.equal(db.issues.length, 1);
+  assert.equal(db.issues[0].issue_code, "DUPLICATE_HEADER");
+  assert.equal(db.issues[0].row_number, null);
+  assert.equal(db.issues[0].record_id, null);
+  assert.equal(transformed, false);
+  assert.equal(recordIdRead, false);
+  assert.equal(diagnosed, false);
 }));
 
 test("invalid headers preserve SCHEMA_HEADER_ERROR semantics", async () => withTempDir(async (dir) => {
